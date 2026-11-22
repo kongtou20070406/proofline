@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proofline"
+version = "0.1.0"
+description = "Zero-GPU, formally verified hardware latency lower bounds (Roofline + Z3 + Lean 4) for PyTorch models."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "kongtou20070406" }]
+keywords = ["pytorch", "roofline", "latency", "z3", "lean4", "formal-verification", "gpu"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.2",
+]
+
+[project.optional-dependencies]
+formal = [
+    "z3-solver>=4.12",
+    "sympy>=1.12",
+]
+dev = [
+    "pytest>=7.4",
+    "z3-solver>=4.12",
+    "sympy>=1.12",
+]
+
+[project.scripts]
+proofline = "proofline.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/kongtou20070406/proofline"
+Repository = "https://github.com/kongtou20070406/proofline.git"
+Issues = "https://github.com/kongtou20070406/proofline/issues"
+
+[tool.setuptools.packages.find]
+include = ["proofline*"]
