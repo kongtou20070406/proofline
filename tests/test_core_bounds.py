@@ -13,9 +13,11 @@ from examples.quickstart_models import conv_block, mlp_block, transformer_block
 from proofline import (
     GPU_PRESETS,
     analyze,
+    dag_from_op,
     dag_from_torch_module,
     derive_symbolic_bounds,
     emit_lean4_certificate,
+    evaluate_dag_bounds,
     phase_report,
     prove_lower_bound_z3,
 )
@@ -90,3 +92,40 @@ def test_z3_and_symbolic_and_lean_emission(tmp_path: Path) -> None:
     assert lean_path.is_file()
     assert lres["certified_ns"] > 0
     assert "theorem certified_speed_limit" in lean_path.read_text(encoding="utf-8")
+
+
+def test_l2_hong_kung_and_fusion_floor_consistency() -> None:
+    pytest.importorskip("z3")
+
+    class _LargeTransformerBlock(nn.Module):
+        def __init__(self, d_model: int = 1024, heads: int = 16) -> None:
+            super().__init__()
+            self.h = heads
+            self.dh = d_model // heads
+            self.ln1 = nn.LayerNorm(d_model)
+            self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+            self.proj = nn.Linear(d_model, d_model, bias=False)
+            self.ln2 = nn.LayerNorm(d_model)
+            self.fc1 = nn.Linear(d_model, 4 * d_model, bias=False)
+            self.fc2 = nn.Linear(4 * d_model, d_model, bias=False)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            b, s, d = x.shape
+            qkv = self.qkv(self.ln1(x)).view(b, s, 3, self.h, self.dh)
+            q, k, v = qkv[:, :, 0].transpose(1, 2), qkv[:, :, 1].transpose(1, 2), qkv[:, :, 2].transpose(1, 2)
+            att = F.softmax((q @ k.transpose(-2, -1)) * (self.dh ** -0.5), dim=-1)
+            h = x + self.proj((att @ v).transpose(1, 2).reshape(b, s, d))
+            return h + self.fc2(F.gelu(self.fc1(self.ln2(h))))
+
+    gpu = GPU_PRESETS["rtx5090_measured"]
+    mod = _LargeTransformerBlock(1024, 16)
+    res = analyze(mod, (2, 1024, 1024), gpu, dtype="bf16")
+    dag = dag_from_torch_module(mod, (2, 1024, 1024), dtype="bf16", gpu=gpu)
+    cert = prove_lower_bound_z3(dag, gpu, phase="forward")
+    assert cert["proven"] is True
+    assert cert["T_abs_floor_us"] <= cert["T_stage_floor_us"]
+    assert abs(cert["T_abs_floor_us"] - res["T_abs_floor_fwd_us"]) / res["T_abs_floor_fwd_us"] < 0.05
+
+    gemm_dag = dag_from_op("gemm", gpu=gpu, B=1, M=16384, N=16384, K=16384, dtype="bf16")
+    gemm_ev = evaluate_dag_bounds(gemm_dag, gpu, phase="forward")
+    assert gemm_ev["Q_hk_MB"] > (3 * 16384 * 16384 * 2) / 1e6

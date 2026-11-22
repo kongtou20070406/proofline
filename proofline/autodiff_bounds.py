@@ -332,7 +332,8 @@ def dag_from_torch_module(
     except Exception:
         m_trace = copy.deepcopy(model).eval()
 
-    meter = _DAGTraceMeter(sm_sram_bytes=g.sm_sram_bytes, b_elem=b_elem, input_requires_grad=input_requires_grad)
+    hbm_fast_bytes = max(float(g.sram_bytes), float(g.sm_sram_bytes))
+    meter = _DAGTraceMeter(sm_sram_bytes=hbm_fast_bytes, b_elem=b_elem, input_requires_grad=input_requires_grad)
     p_bytes = meter.register_params(m_trace)
 
     err = None
@@ -347,7 +348,7 @@ def dag_from_torch_module(
                 err = repr(exc)[:240]
 
     if out_val is None and err is not None:
-        meter = _DAGTraceMeter(sm_sram_bytes=g.sm_sram_bytes, b_elem=b_elem, input_requires_grad=input_requires_grad)
+        meter = _DAGTraceMeter(sm_sram_bytes=hbm_fast_bytes, b_elem=b_elem, input_requires_grad=input_requires_grad)
         p_bytes = meter.register_params(m_trace)
         x_m = torch.empty(*ex_shape, device="meta", dtype=target_dtype)
         meter.register_model_inputs(x_m)
@@ -371,6 +372,7 @@ def dag_from_torch_module(
 def dag_from_op(op_name: str, gpu: GPU | None = None, **kw: Any) -> ComputeDAG:
     """Build exact symbolic AD DAG for canonical analytical operators."""
     g = gpu or GPU_PRESETS["rtx5090_measured"]
+    hbm_fast_bytes = max(float(g.sram_bytes), float(g.sm_sram_bytes))
     key = op_name.lower().strip()
     dt = kw.get("dtype", "bf16")
     b_elem = dtype_bytes(dt)
@@ -384,7 +386,7 @@ def dag_from_op(op_name: str, gpu: GPU | None = None, **kw: Any) -> ComputeDAG:
         req_p = bool(kw.get("requires_grad_param", True))
         w = float(2 * B * M * N * K)
         q_comp = float((B * M * K + K * N + B * M * N) * b_elem)
-        q_hk = _hong_kung_gemm_io(M, N, K, B, b_elem, q_comp, g.sm_sram_bytes)
+        q_hk = _hong_kung_gemm_io(M, N, K, B, b_elem, q_comp, hbm_fast_bytes)
         act_b = float(B * M * K * b_elem)
         node = OpNode(
             0, "gemm", "gemm",
@@ -415,7 +417,7 @@ def dag_from_op(op_name: str, gpu: GPU | None = None, **kw: Any) -> ComputeDAG:
         causal = bool(kw.get("causal", False))
         w = float((2 if causal else 4) * B * H * N * N * D)
         q_comp = float(4 * B * H * N * D * b_elem)
-        q_hk = _hong_kung_sdpa_io(H * B, N, N, D, b_elem, q_comp, g.sm_sram_bytes, causal)
+        q_hk = _hong_kung_sdpa_io(H * B, N, N, D, b_elem, q_comp, hbm_fast_bytes, causal)
         node = OpNode(
             0, "sdpa", "sdpa",
             W_fwd=w,
@@ -584,15 +586,17 @@ def evaluate_dag_bounds(dag: ComputeDAG, device: GPU, phase: str = "train_store"
     # Forward totals & critical path
     w_fwd_tot = sum(n.W_fwd for n in nodes)
     q_fwd_stage_tot = sum(n.Q_fwd for n in nodes)
-    q_fwd_hk_tot = max(dag.input_bytes + dag.output_bytes + dag.param_bytes, sum(n.Q_hk_fwd for n in nodes) if any(n.Q_hk_fwd > n.Q_fwd for n in nodes) else 0.0)
-    q_fwd_min_io = max(dag.input_bytes + dag.output_bytes + min(dag.param_bytes, q_fwd_stage_tot), q_fwd_hk_tot)
+    q_fwd_compulsory = dag.input_bytes + dag.output_bytes + min(dag.param_bytes, q_fwd_stage_tot)
+    q_fwd_hk_excess = sum(max(0.0, n.Q_hk_fwd - n.Q_fwd) for n in nodes)
+    q_fwd_hk_max_op = max((n.Q_hk_fwd for n in nodes if n.Q_hk_fwd > n.Q_fwd), default=0.0)
+    q_fwd_hk_tot = max(q_fwd_compulsory + q_fwd_hk_excess, q_fwd_hk_max_op)
+    q_fwd_min_io = max(q_fwd_compulsory, q_fwd_hk_tot)
     s_fwd_crit = _longest_chain(nodes, [n.tau_fwd for n in nodes])
     t_fwd_abs = max(w_fwd_tot / f_eff, q_fwd_min_io / bw, s_fwd_crit * tau_g)
     t_fwd_stage = sum(max(n.W_fwd / f_eff, max(n.Q_fwd, n.Q_hk_fwd) / bw, n.tau_fwd * tau_g) for n in nodes) if nodes else 0.0
     t_fwd_eager = t_fwd_stage + len(nodes) * tau_e
 
     # Backward: split dX (on serial chain) vs dW (branches in parallel off dX chain, only trailing step adds at most 1*tau if on critical tail)
-    rev_nodes = list(nodes)
     # Build reverse DAG dependency order for dX
     children_map: dict[int, list[int]] = {i: [] for i in range(len(nodes))}
     for n in nodes:
@@ -613,7 +617,9 @@ def evaluate_dag_bounds(dag: ComputeDAG, device: GPU, phase: str = "train_store"
 
     w_bwd_tot = sum(n.W_bwd_dx + n.W_bwd_dw for n in nodes)
     q_bwd_store_tot = sum(n.Q_bwd_store for n in nodes)
-    q_bwd_hk_tot = sum(n.Q_hk_bwd for n in nodes)
+    q_bwd_hk_excess_store = sum(max(0.0, n.Q_hk_bwd - n.Q_bwd_store) for n in nodes)
+    q_bwd_hk_excess_remat = sum(max(0.0, n.Q_hk_bwd - n.Q_bwd_remat) for n in nodes)
+    q_bwd_hk_max_op = max((n.Q_hk_bwd for n in nodes if n.Q_hk_bwd > n.Q_bwd_store), default=0.0)
 
     # Optimal rematerialization: per node pay min(2 * act_save / BW, remat_flops / F_eff)
     t_ckpt_extra = 0.0
@@ -633,11 +639,19 @@ def evaluate_dag_bounds(dag: ComputeDAG, device: GPU, phase: str = "train_store"
 
     if phase == "forward":
         w_sel, q_sel, q_min_sel, s_sel = w_fwd_tot, q_fwd_stage_tot, q_fwd_min_io, s_fwd_crit
+        q_comp_only = q_fwd_compulsory
         t_stage_sel = t_fwd_stage
     elif phase == "train_remat":
         w_sel = w_fwd_tot + w_bwd_remat_tot
         q_sel = q_fwd_stage_tot + q_bwd_remat_tot
-        q_min_sel = max(q_fwd_min_io + max(dag.param_bytes, q_bwd_hk_tot), q_sel)
+        q_train_comp_remat = (
+            q_fwd_compulsory
+            + dag.output_bytes
+            + dag.param_bytes
+            + (dag.input_bytes if any(n.requires_grad_in for n in nodes) else 0.0)
+        )
+        q_min_sel = max(q_train_comp_remat, q_fwd_min_io + dag.param_bytes + q_bwd_hk_excess_remat, q_bwd_hk_max_op)
+        q_comp_only = q_train_comp_remat
         s_sel = s_fwd_crit + s_bwd_crit
         t_stage_sel = t_fwd_stage + t_ckpt_extra + sum(
             max((n.W_bwd_dx + n.W_bwd_dw) / f_eff, n.Q_bwd_remat / bw, (n.tau_bwd if (n.requires_grad_in or n.requires_grad_param) else 0.0) * tau_g)
@@ -646,7 +660,9 @@ def evaluate_dag_bounds(dag: ComputeDAG, device: GPU, phase: str = "train_store"
     else:  # train_store (default)
         w_sel = w_fwd_tot + w_bwd_tot
         q_sel = q_fwd_stage_tot + q_bwd_store_tot
-        q_min_sel = max(q_fwd_min_io + max(dag.param_bytes, q_bwd_hk_tot), 2.0 * dag.input_bytes + 2.0 * dag.param_bytes + 2.0 * dag.output_bytes)
+        q_train_comp_store = 2.0 * dag.input_bytes + 2.0 * dag.param_bytes + 2.0 * dag.output_bytes
+        q_min_sel = max(q_train_comp_store, q_fwd_min_io + dag.param_bytes + q_bwd_hk_excess_store, q_bwd_hk_max_op)
+        q_comp_only = q_train_comp_store
         s_sel = s_fwd_crit + s_bwd_crit
         t_stage_sel = t_fwd_stage + sum(
             max((n.W_bwd_dx + n.W_bwd_dw) / f_eff, max(n.Q_bwd_store, n.Q_hk_bwd) / bw, (n.tau_bwd if (n.requires_grad_in or n.requires_grad_param) else 0.0) * tau_g)
@@ -654,9 +670,9 @@ def evaluate_dag_bounds(dag: ComputeDAG, device: GPU, phase: str = "train_store"
         )
 
     # Check Hong-Kung dominant term vs compulsory I/O
-    q_hk_phase = q_fwd_hk_tot if phase == "forward" else max(q_fwd_hk_tot + q_bwd_hk_tot, q_min_sel)
+    q_hk_phase = q_fwd_hk_tot if phase == "forward" else q_min_sel
     t_comp_abs = w_sel / f_eff
-    t_mem_abs = q_min_sel / bw
+    t_mem_abs = q_comp_only / bw
     t_hk_abs = q_hk_phase / bw
     t_ser_abs = s_sel * tau_g
     t_abs_floor = max(t_comp_abs, t_mem_abs, t_hk_abs, t_ser_abs)
