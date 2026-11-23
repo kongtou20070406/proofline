@@ -44,3 +44,6 @@ Issues = "https://github.com/kongtou20070406/proofline/issues"
 
 [tool.setuptools.packages.find]
 include = ["proofline*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
