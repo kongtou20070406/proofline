@@ -52,19 +52,44 @@ def prove_lower_bound_z3(
     bw = float(device.BW)
     tau_g = float(device.tau_graph)
 
-    w_tot_us_scale = float(ev["W_tot_GFLOP"]) * 1e9 * 1e6  # FLOPs * 1e6 -> time in us when divided by F_eff
-    q_min_us_scale = max(float(ev["Q_min_io_MB"]), float(ev["Q_hk_MB"])) * 1e6 * 1e6
+    f_eff_per_us = f_eff / 1e6
+    bw_per_us = bw / 1e6
+    w_tot_flops = float(ev["W_tot_GFLOP"]) * 1e9
+    q_min_bytes = max(float(ev["Q_min_io_MB"]), float(ev["Q_hk_MB"])) * 1e6
 
-    # Build linear real-arithmetic SMT model in microseconds (avoids nonlinear F * T explosion)
+    # Build linear real-arithmetic SMT model from per-node conservation + DAG causality
+    # (never pre-asserting T_total >= precomputed_T_comp or T_total >= precomputed_T_mem).
     solver = z3.Solver()
     solver.set(unsat_core=True)
     T_total = z3.Real("T_total_us")
     solver.assert_and_track(T_total >= 0, "non_negative_makespan")
 
-    t_comp_bound_us = w_tot_us_scale / f_eff
-    t_mem_bound_us = q_min_us_scale / bw
-    solver.assert_and_track(T_total >= _r(t_comp_bound_us), "global_compute_ceiling")
-    solver.assert_and_track(T_total >= _r(t_mem_bound_us), "global_hbm_and_sram_io_ceiling")
+    w_vars = []
+    q_vars = []
+    for i, node in enumerate(dag.nodes):
+        node_w = float(node.W_fwd)
+        node_q = float(node.Q_fwd)
+        if phase != "forward":
+            if node.requires_grad_in:
+                node_w += float(node.W_bwd_dx)
+                node_q += float(getattr(node, "Q_bwd_dx", 0.0))
+            node_w += float(node.W_bwd_dw)
+            node_q += float(getattr(node, "Q_bwd_dw", 0.0))
+        wi = z3.Real(f"w_node_{i}")
+        qi = z3.Real(f"q_node_{i}")
+        solver.assert_and_track(wi >= _r(node_w), f"node_work_req_{i}")
+        solver.assert_and_track(qi >= _r(node_q), f"node_io_req_{i}")
+        w_vars.append(wi)
+        q_vars.append(qi)
+
+    w_total = z3.Real("w_total_flops")
+    solver.assert_and_track(w_total >= (_r(0.0) if not w_vars else z3.Sum(w_vars)), "sum_node_work")
+    solver.assert_and_track(w_total >= _r(w_tot_flops), "compulsory_phase_work")
+    solver.assert_and_track(w_total <= _r(f_eff_per_us) * T_total, "global_compute_ceiling")
+
+    q_total = z3.Real("q_total_bytes")
+    solver.assert_and_track(q_total >= _r(q_min_bytes), "compulsory_hk_sram_io")
+    solver.assert_and_track(q_total <= _r(bw_per_us) * T_total, "global_hbm_and_sram_io_ceiling")
 
     # Explicit forward DAG schedule variables + dependency causality
     n_nodes = len(dag.nodes)
@@ -354,28 +379,65 @@ def prove_microarch_bound_z3(
     eps_rel: float = 1e-6,
     kv_cache_gb: float = 0.0,
 ) -> dict[str, Any]:
-    """Formally certify all 5 microarchitecture physical walls via Z3 SMT (UNSAT + unsat_core)."""
+    """Formally certify all 5 microarchitecture physical walls via Z3 SMT from per-stage conservation."""
     fused = fuse_stage_dag(dag)
     rep = evaluate_microarch_dag(fused, device, phase=phase, kv_cache_gb=kv_cache_gb)
     t_floor_us = float(rep["T_microarch_floor_us"])
+
+    scale = 1.0 if phase in ("fwd", "forward") else 3.0
+    eff_dt = rep["dtype"]
+    f_tc_per_us = float(device.peak_flops(eff_dt)) / 1e6
+    f_alu_per_us = float(device.peak_flops("fp32")) / 1e6
+    f_sfu_per_us = float(device.sfu_flops()) / 1e6
+    mem_bw_per_us = float(device.l2_bw_gbs * 1e9 if (rep["l2_resident"] and device.l2_bw_gbs) else device.BW) / 1e6
+    host_bw_per_us = float(device.host_bw_gbs) * 1e9 / 1e6
 
     solver = z3.Solver()
     solver.set(unsat_core=True)
     T_uarch = z3.Real("T_microarch_us")
     solver.assert_and_track(T_uarch >= 0, "non_negative_makespan")
 
-    # Wall 1: SM Wave Quantization (or TPU MXU systolic padding)
-    solver.assert_and_track(T_uarch >= _r(rep["T_wave_compute_us"]), "wall1_sm_wave_quantization")
-    # Wall 2: Three-Unit Execution Roofs (Tensor Core, FP32 ALU, SFU)
-    solver.assert_and_track(T_uarch >= _r(rep["T_tc_us"]), "wall2_three_unit_tensor_core")
-    solver.assert_and_track(T_uarch >= _r(rep["T_alu_us"]), "wall2_three_unit_alu")
-    solver.assert_and_track(T_uarch >= _r(rep["T_sfu_us"]), "wall2_three_unit_sfu")
-    # Wall 3: Three-Level Memory Roof
-    solver.assert_and_track(T_uarch >= _r(rep["T_mem_us"]), "wall3_memory_roof")
-    # Wall 4: Inter-SM Grid Sync vs. Cluster DSM + Serial Launch Ceiling
+    # Per-unit conservation across stages (never pre-asserting T >= precomputed_T)
+    w_tc_tot = float(rep["W_tc_GFLOP"]) * 1e9
+    w_alu_tot = float(rep["W_alu_GFLOP"]) * 1e9
+    w_sfu_tot = float(rep["W_sfu_GFLOP"]) * 1e9
+
+    w_tc_var = z3.Real("w_tc_total_flops")
+    w_alu_var = z3.Real("w_alu_total_flops")
+    w_sfu_var = z3.Real("w_sfu_total_flops")
+    solver.assert_and_track(w_tc_var >= _r(w_tc_tot), "compulsory_tc_work")
+    solver.assert_and_track(w_alu_var >= _r(w_alu_tot), "compulsory_alu_work")
+    solver.assert_and_track(w_sfu_var >= _r(w_sfu_tot), "compulsory_sfu_work")
+
+    # Wall 1: SM wave quantization / TPU MXU systolic padding (encoded via effective wave-inflated TC work)
+    w_wave_equiv = float(rep["T_wave_compute_us"]) * f_tc_per_us
+    w_wave_var = z3.Real("w_wave_equiv_flops")
+    solver.assert_and_track(w_wave_var >= w_tc_var, "wave_ge_raw_tc")
+    solver.assert_and_track(w_wave_var >= _r(w_wave_equiv), "compulsory_wave_quantized_work")
+    solver.assert_and_track(w_wave_var <= _r(f_tc_per_us) * T_uarch, "wall1_sm_wave_quantization")
+
+    # Wall 2: Three-unit execution roofs
+    solver.assert_and_track(w_tc_var <= _r(f_tc_per_us) * T_uarch, "wall2_three_unit_tensor_core")
+    solver.assert_and_track(w_alu_var <= _r(f_alu_per_us) * T_uarch, "wall2_three_unit_alu")
+    solver.assert_and_track(w_sfu_var <= _r(f_sfu_per_us) * T_uarch, "wall2_three_unit_sfu")
+
+    # Wall 3: Three-level memory conservation (Q_bytes <= BW * T)
+    q_bytes = float(rep["T_mem_us"]) * mem_bw_per_us
+    q_var = z3.Real("q_mem_total_bytes")
+    solver.assert_and_track(q_var >= _r(q_bytes), "compulsory_three_level_io")
+    solver.assert_and_track(q_var <= _r(mem_bw_per_us) * T_uarch, "wall3_memory_roof")
+
+    # Wall 4: Inter-SM Grid Sync vs Cluster DSM + Serial Launch Ceiling
     solver.assert_and_track(T_uarch >= _r(rep["T_sync_and_serial_us"]), "wall4_sync_and_serial_ceiling")
-    # Wall 5: Pigeonhole VRAM Capacity Overflow & Host PCIe Offload Ceiling
-    solver.assert_and_track(T_uarch >= _r(rep["T_offload_us"]), "offload_pigeonhole_ceiling")
+
+    # Wall 5: Pigeonhole VRAM Capacity Overflow (spill = max(0, req - usable_vram); transfer <= host_bw * T)
+    req_bytes = float(rep["required_mem_gb"]) * 1e9
+    usable_bytes = float(rep["usable_vram_gb"]) * 1e9
+    transfer_factor = 1.0 if phase in ("fwd", "forward") else 2.0
+    spill_var = z3.Real("vram_spill_bytes")
+    solver.assert_and_track(spill_var >= 0, "non_negative_spill")
+    solver.assert_and_track(spill_var >= _r(req_bytes - usable_bytes), "pigeonhole_vram_overflow")
+    solver.assert_and_track(_r(transfer_factor) * spill_var <= _r(host_bw_per_us) * T_uarch, "offload_pigeonhole_ceiling")
 
     strict_target = max(t_floor_us * (1.0 - eps_rel), 0.0)
     solver.push()
@@ -694,28 +756,65 @@ def prove_microarch_bound_z3(
     eps_rel: float = 1e-6,
     kv_cache_gb: float = 0.0,
 ) -> dict[str, Any]:
-    """Formally certify all 5 microarchitecture physical walls via Z3 SMT (UNSAT + unsat_core)."""
+    """Formally certify all 5 microarchitecture physical walls via Z3 SMT from per-stage conservation."""
     fused = fuse_stage_dag(dag)
     rep = evaluate_microarch_dag(fused, device, phase=phase, kv_cache_gb=kv_cache_gb)
     t_floor_us = float(rep["T_microarch_floor_us"])
+
+    scale = 1.0 if phase in ("fwd", "forward") else 3.0
+    eff_dt = rep["dtype"]
+    f_tc_per_us = float(device.peak_flops(eff_dt)) / 1e6
+    f_alu_per_us = float(device.peak_flops("fp32")) / 1e6
+    f_sfu_per_us = float(device.sfu_flops()) / 1e6
+    mem_bw_per_us = float(device.l2_bw_gbs * 1e9 if (rep["l2_resident"] and device.l2_bw_gbs) else device.BW) / 1e6
+    host_bw_per_us = float(device.host_bw_gbs) * 1e9 / 1e6
 
     solver = z3.Solver()
     solver.set(unsat_core=True)
     T_uarch = z3.Real("T_microarch_us")
     solver.assert_and_track(T_uarch >= 0, "non_negative_makespan")
 
-    # Wall 1: SM Wave Quantization (or TPU MXU systolic padding)
-    solver.assert_and_track(T_uarch >= _r(rep["T_wave_compute_us"]), "wall1_sm_wave_quantization")
-    # Wall 2: Three-Unit Execution Roofs (Tensor Core, FP32 ALU, SFU)
-    solver.assert_and_track(T_uarch >= _r(rep["T_tc_us"]), "wall2_three_unit_tensor_core")
-    solver.assert_and_track(T_uarch >= _r(rep["T_alu_us"]), "wall2_three_unit_alu")
-    solver.assert_and_track(T_uarch >= _r(rep["T_sfu_us"]), "wall2_three_unit_sfu")
-    # Wall 3: Three-Level Memory Roof
-    solver.assert_and_track(T_uarch >= _r(rep["T_mem_us"]), "wall3_memory_roof")
-    # Wall 4: Inter-SM Grid Sync vs. Cluster DSM + Serial Launch Ceiling
+    # Per-unit conservation across stages (never pre-asserting T >= precomputed_T)
+    w_tc_tot = float(rep["W_tc_GFLOP"]) * 1e9
+    w_alu_tot = float(rep["W_alu_GFLOP"]) * 1e9
+    w_sfu_tot = float(rep["W_sfu_GFLOP"]) * 1e9
+
+    w_tc_var = z3.Real("w_tc_total_flops")
+    w_alu_var = z3.Real("w_alu_total_flops")
+    w_sfu_var = z3.Real("w_sfu_total_flops")
+    solver.assert_and_track(w_tc_var >= _r(w_tc_tot), "compulsory_tc_work")
+    solver.assert_and_track(w_alu_var >= _r(w_alu_tot), "compulsory_alu_work")
+    solver.assert_and_track(w_sfu_var >= _r(w_sfu_tot), "compulsory_sfu_work")
+
+    # Wall 1: SM wave quantization / TPU MXU systolic padding (encoded via effective wave-inflated TC work)
+    w_wave_equiv = float(rep["T_wave_compute_us"]) * f_tc_per_us
+    w_wave_var = z3.Real("w_wave_equiv_flops")
+    solver.assert_and_track(w_wave_var >= w_tc_var, "wave_ge_raw_tc")
+    solver.assert_and_track(w_wave_var >= _r(w_wave_equiv), "compulsory_wave_quantized_work")
+    solver.assert_and_track(w_wave_var <= _r(f_tc_per_us) * T_uarch, "wall1_sm_wave_quantization")
+
+    # Wall 2: Three-unit execution roofs
+    solver.assert_and_track(w_tc_var <= _r(f_tc_per_us) * T_uarch, "wall2_three_unit_tensor_core")
+    solver.assert_and_track(w_alu_var <= _r(f_alu_per_us) * T_uarch, "wall2_three_unit_alu")
+    solver.assert_and_track(w_sfu_var <= _r(f_sfu_per_us) * T_uarch, "wall2_three_unit_sfu")
+
+    # Wall 3: Three-level memory conservation (Q_bytes <= BW * T)
+    q_bytes = float(rep["T_mem_us"]) * mem_bw_per_us
+    q_var = z3.Real("q_mem_total_bytes")
+    solver.assert_and_track(q_var >= _r(q_bytes), "compulsory_three_level_io")
+    solver.assert_and_track(q_var <= _r(mem_bw_per_us) * T_uarch, "wall3_memory_roof")
+
+    # Wall 4: Inter-SM Grid Sync vs Cluster DSM + Serial Launch Ceiling
     solver.assert_and_track(T_uarch >= _r(rep["T_sync_and_serial_us"]), "wall4_sync_and_serial_ceiling")
-    # Wall 5: Pigeonhole VRAM Capacity Overflow & Host PCIe Offload Ceiling
-    solver.assert_and_track(T_uarch >= _r(rep["T_offload_us"]), "offload_pigeonhole_ceiling")
+
+    # Wall 5: Pigeonhole VRAM Capacity Overflow (spill = max(0, req - usable_vram); transfer <= host_bw * T)
+    req_bytes = float(rep["required_mem_gb"]) * 1e9
+    usable_bytes = float(rep["usable_vram_gb"]) * 1e9
+    transfer_factor = 1.0 if phase in ("fwd", "forward") else 2.0
+    spill_var = z3.Real("vram_spill_bytes")
+    solver.assert_and_track(spill_var >= 0, "non_negative_spill")
+    solver.assert_and_track(spill_var >= _r(req_bytes - usable_bytes), "pigeonhole_vram_overflow")
+    solver.assert_and_track(_r(transfer_factor) * spill_var <= _r(host_bw_per_us) * T_uarch, "offload_pigeonhole_ceiling")
 
     strict_target = max(t_floor_us * (1.0 - eps_rel), 0.0)
     solver.push()

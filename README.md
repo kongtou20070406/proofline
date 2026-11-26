@@ -165,9 +165,12 @@ Proofline couples empirical CPU tracing with machine-checked certificates inside
 3. **Idealized hardware model**: abstract machine constants ($F_{\text{eff}}, B, \text{L2}, N_{\text{SM}}, \tau$) and scheduling/cache/fusion axioms match the target hardware and compiler regime.
 
 Within that explicit model:
-- **Z3 SMT (`prove_lower_bound_z3`, `prove_microarch_bound_z3`, `prove_rewrite_family_z3`)**: Checks `UNSAT` (with minimal `unsat_core`) that no schedule satisfying the model's compute/memory/wave/sync/offload axioms can beat the reported floor, alongside a `SAT` feasibility witness.
+- **Z3 SMT (`prove_lower_bound_z3`, `prove_microarch_bound_z3`, `prove_rewrite_family_z3`)**: Encodes per-node / per-unit resource conservation ($w_i \ge W_i$, $\sum w_i \le F_{\text{eff}} T$), DAG precedence, and pigeonhole VRAM spill constraints, checking `UNSAT` (with minimal `unsat_core`) below the floor alongside a `SAT` feasibility witness.
 - **SymPy (`derive_symbolic_bounds`)**: Emits exact closed-form `W_fwd`, `W_train`, Hong–Kung tiled `Q_hk`, and compute-bound critical arithmetic intensity (`F / BW`).
-- **Lean 4 ([`proofs/PerfRulerBounds.lean`](proofs/PerfRulerBounds.lean))**: Standalone `import Std` theorems (`EXIT=0` under `lean -DwarningAsError=true`, zero `sorry`) checking universal DAG makespan bounds, reverse-mode AD critical paths, three-unit/wave-quantization ceilings, Hong–Kung SRAM I/O bounds, and pigeonhole VRAM offload bounds, plus auto-generated per-model certificates (`emit_lean4_certificate`, sample in [`proofs/examples/RecurrentWM_RTX5090_Cert.lean`](proofs/examples/RecurrentWM_RTX5090_Cert.lean)).
+- **Lean 4 (pure `import Std`, zero `sorry`, `lean -DwarningAsError=true`)**:
+  - [`proofs/OperationalBounds.lean`](proofs/OperationalBounds.lean): Derives compute, memory, three-unit (`TC`/`ALU`/`SFU`), and critical-path lower bounds from local per-tick hardware capacity traces via Fubini double-summation swap (`OpTrace`, without assuming global `compute`/`memory` inequality fields).
+  - [`proofs/PebbleIOBounds.lean`](proofs/PebbleIOBounds.lean): Proves cold-miss, pigeonhole VRAM spill (`|req| - V <= loadCount`), and Hong–Kung epoch access bounds (`<= M + loadCount`) by structural induction over an explicit cache state machine (`CacheState` + `ValidRun`).
+  - [`proofs/PerfRulerBounds.lean`](proofs/PerfRulerBounds.lean) & `emit_lean4_certificate`: Universal DAG makespan theorems and auto-generated per-model certificates (sample in [`proofs/examples/RecurrentWM_RTX5090_Cert.lean`](proofs/examples/RecurrentWM_RTX5090_Cert.lean)).
 
 ## Contributing & License
 

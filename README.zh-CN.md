@@ -165,9 +165,12 @@ Proofline 将纯 CPU 图追踪与**显式理想化 Roofline / 调度模型**下�
 3. **理想化硬件与调度模型边界**：抽象硬件参数（$F_{\text{eff}}, B, \text{L2}, N_{\text{SM}}, \tau$）及缓存/融合/同步公理是否贴合目标芯片与编译器实际行为。
 
 在此显式模型内：
-- **Z3 SMT（`prove_lower_bound_z3`、`prove_microarch_bound_z3`、`prove_rewrite_family_z3`）**：用 `UNSAT` 与最小冲突核检验在算力、访存、波次、同步及显存溢出约束下不存在更低的合法时延，同时给出可达 `SAT` 构造见证。
+- **Z3 SMT（`prove_lower_bound_z3`、`prove_microarch_bound_z3`、`prove_rewrite_family_z3`）**：显式编码逐算子/逐单元资源守恒（$w_i \ge W_i$、$\sum w_i \le F_{\text{eff}} T$）、DAG 因果依赖与鸽笼显存溢出约束，以 `UNSAT` 与最小冲突核检验不存在更低合法时延，并给出可达 `SAT` 见证。
 - **SymPy（`derive_symbolic_bounds`）**：自动推导 `W_fwd`、`W_train`、Hong–Kung 分块 I/O 及算力/访存临界算术强度（`F / BW`）。
-- **Lean 4（[`proofs/PerfRulerBounds.lean`](proofs/PerfRulerBounds.lean)）**：纯 `import Std` 零外部数学库依赖、零 `sorry`（通过 `lean -DwarningAsError=true` 零警告校验），机器检查通用 DAG 关键路径、反向传播依赖、三单元/波次量化、Hong–Kung I/O 及显存溢出搬运不等式；并支持一键生成模型证书（参考样例 [`proofs/examples/RecurrentWM_RTX5090_Cert.lean`](proofs/examples/RecurrentWM_RTX5090_Cert.lean)）。
+- **Lean 4（纯 `import Std`、零 `sorry`、`lean -DwarningAsError=true` 零警告）**：
+  - [`proofs/OperationalBounds.lean`](proofs/OperationalBounds.lean)：从离散时间步的局部硬件容量轨迹出发，通过 Fubini 双重求和交换直接推导出算力、访存、三单元（`TC`/`ALU`/`SFU`）与关键路径下界（不再把全局不等式假设为结构字段）。
+  - [`proofs/PebbleIOBounds.lean`](proofs/PebbleIOBounds.lean)：在显式缓存状态机（`CacheState` + `ValidRun`）上按结构归纳证明冷启动未命中、鸽笼显存溢出（`|req| - V <= loadCount`）与 Hong–Kung 时间片访问上界（`<= M + loadCount`）。
+  - [`proofs/PerfRulerBounds.lean`](proofs/PerfRulerBounds.lean) 与 `emit_lean4_certificate`：通用调度下界定理与逐模型自动证书（参考样例 [`proofs/examples/RecurrentWM_RTX5090_Cert.lean`](proofs/examples/RecurrentWM_RTX5090_Cert.lean)）。
 
 ## 参与贡献与开源协议
 
