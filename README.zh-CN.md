@@ -2,7 +2,7 @@
 
 # Proofline
 
-**零 GPU、带 Z3 + Lean 4 形式化证明的 PyTorch 硬件理论时延下限分析工具。**
+**零 GPU PyTorch 性能预算器：在显式理想化 Roofline / 调度模型下输出 Z3 + Lean 4 机器核验时延下界证书。**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](pyproject.toml)
@@ -157,12 +157,17 @@ FP8(g128)+2:4  yes          20.54      19.53    14.604    2.00x serial   6 (norm
 [RewriteOpt] transformer_block T_base=30.69us -> T_rewrite=30.69us (1.00x) proven=True groups=16
 ```
 
-## 形式化证明（Z3 + SymPy + Lean 4）
+## 机器核验下界证书与三层显式假设（Z3 + SymPy + Lean 4）
 
-Proofline 将图追踪与三层机器证明直接绑定：
-- **Z3 SMT（`prove_lower_bound_z3`）**：用 `UNSAT` 与最小冲突核证明任何满足因果依赖的调度都无法低于 `T_abs_floor`，同时给出可达 `SAT` 构造见证。
+Proofline 将纯 CPU 图追踪与**显式理想化 Roofline / 调度模型**下的机器核验绑定在一起。Z3 与 Lean 4 证明的是“在该组显式调度与硬件公理内部不存在更快的合法调度”，而不是对真实芯片微码、驱动或编译器实现做端到端语义验证。每份证书都显式依赖三层假设：
+1. **计算图追踪保真度**：`FakeTensorMode` / FX 追踪是否完整捕获了真实运行时的全部算子、张量形状与依赖关系（未被追踪的动态控制流或外部副作用不在覆盖范围内）。
+2. **必做计算与访存量（$W, Q$）的不可回避性**：所统计的 FLOPs 与访存流量在固定算法、精度或声明的严格等价改写族 $\mathcal{R}_{\text{exact}}$ 下是否确实无法绕开。
+3. **理想化硬件与调度模型边界**：抽象硬件参数（$F_{\text{eff}}, B, \text{L2}, N_{\text{SM}}, \tau$）及缓存/融合/同步公理是否贴合目标芯片与编译器实际行为。
+
+在此显式模型内：
+- **Z3 SMT（`prove_lower_bound_z3`、`prove_microarch_bound_z3`、`prove_rewrite_family_z3`）**：用 `UNSAT` 与最小冲突核检验在算力、访存、波次、同步及显存溢出约束下不存在更低的合法时延，同时给出可达 `SAT` 构造见证。
 - **SymPy（`derive_symbolic_bounds`）**：自动推导 `W_fwd`、`W_train`、Hong–Kung 分块 I/O 及算力/访存临界算术强度（`F / BW`）。
-- **Lean 4（[`proofs/PerfRulerBounds.lean`](proofs/PerfRulerBounds.lean)）**：纯 `import Std` 零外部数学库依赖、零 `sorry`（通过 `lean -DwarningAsError=true` 零警告校验），严格证明通用 DAG 关键路径、反向传播依赖、重计算交叉阈值及 Hong–Kung I/O 下界；并支持为任意 PyTorch 模型一键生成可编译证书（参考样例 [`proofs/examples/RecurrentWM_RTX5090_Cert.lean`](proofs/examples/RecurrentWM_RTX5090_Cert.lean)）。
+- **Lean 4（[`proofs/PerfRulerBounds.lean`](proofs/PerfRulerBounds.lean)）**：纯 `import Std` 零外部数学库依赖、零 `sorry`（通过 `lean -DwarningAsError=true` 零警告校验），机器检查通用 DAG 关键路径、反向传播依赖、三单元/波次量化、Hong–Kung I/O 及显存溢出搬运不等式；并支持一键生成模型证书（参考样例 [`proofs/examples/RecurrentWM_RTX5090_Cert.lean`](proofs/examples/RecurrentWM_RTX5090_Cert.lean)）。
 
 ## 参与贡献与开源协议
 

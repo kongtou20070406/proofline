@@ -2,7 +2,7 @@ English · [简体中文](README.zh-CN.md)
 
 # Proofline
 
-**Zero-GPU, formally verified hardware latency lower bounds (Roofline + Z3 + Lean 4) for PyTorch models.**
+**Zero-GPU Roofline performance profiler with machine-checked latency-bound certificates (Z3 + Lean 4) under an explicit idealized roofline/scheduling model.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](pyproject.toml)
@@ -157,12 +157,17 @@ FP8(g128)+2:4  yes          20.54      19.53    14.604    2.00x serial   6 (norm
 [RewriteOpt] transformer_block T_base=30.69us -> T_rewrite=30.69us (1.00x) proven=True groups=16
 ```
 
-## Formal Proofs (Z3 + SymPy + Lean 4)
+## Machine-Checked Certificates & Explicit Assumptions (Z3 + SymPy + Lean 4)
 
-Proofline couples empirical tracing with machine-checked certificates:
-- **Z3 SMT (`prove_lower_bound_z3`)**: Proves `UNSAT` (with minimal `unsat_core`) that no dependency-respecting schedule can execute strictly below `T_abs_floor`, alongside a `SAT` feasibility witness at `T_abs_floor`.
+Proofline couples empirical CPU tracing with machine-checked certificates inside an **explicit idealized roofline and scheduling model**. These certificates verify arithmetic and logical consistency under the model's axioms—they do not independently verify real silicon microcode, driver behavior, or compiler passes. Every bound rests on three explicit assumption layers:
+1. **DAG trace fidelity**: `FakeTensorMode` / FX tracing faithfully captures all runtime ops, tensor shapes, and data dependencies (untraced Python side effects or dynamic data-dependent control flow fall outside the trace).
+2. **Compulsory work & I/O ($W, Q$)**: the accounted FLOPs and memory traffic are genuinely unavoidable under the fixed algorithm, precision, or declared exact rewrite family $\mathcal{R}_{\text{exact}}$.
+3. **Idealized hardware model**: abstract machine constants ($F_{\text{eff}}, B, \text{L2}, N_{\text{SM}}, \tau$) and scheduling/cache/fusion axioms match the target hardware and compiler regime.
+
+Within that explicit model:
+- **Z3 SMT (`prove_lower_bound_z3`, `prove_microarch_bound_z3`, `prove_rewrite_family_z3`)**: Checks `UNSAT` (with minimal `unsat_core`) that no schedule satisfying the model's compute/memory/wave/sync/offload axioms can beat the reported floor, alongside a `SAT` feasibility witness.
 - **SymPy (`derive_symbolic_bounds`)**: Emits exact closed-form `W_fwd`, `W_train`, Hong–Kung tiled `Q_hk`, and compute-bound critical arithmetic intensity (`F / BW`).
-- **Lean 4 ([`proofs/PerfRulerBounds.lean`](proofs/PerfRulerBounds.lean))**: Standalone `import Std` theorems (`EXIT=0` under `lean -DwarningAsError=true`, zero `sorry`) covering universal DAG makespan bounds, reverse-mode AD critical paths, recomputation-vs-storage crossovers, and Hong–Kung SRAM I/O lower bounds, plus auto-generated per-model certificates (`emit_lean4_certificate`, sample in [`proofs/examples/RecurrentWM_RTX5090_Cert.lean`](proofs/examples/RecurrentWM_RTX5090_Cert.lean)).
+- **Lean 4 ([`proofs/PerfRulerBounds.lean`](proofs/PerfRulerBounds.lean))**: Standalone `import Std` theorems (`EXIT=0` under `lean -DwarningAsError=true`, zero `sorry`) checking universal DAG makespan bounds, reverse-mode AD critical paths, three-unit/wave-quantization ceilings, Hong–Kung SRAM I/O bounds, and pigeonhole VRAM offload bounds, plus auto-generated per-model certificates (`emit_lean4_certificate`, sample in [`proofs/examples/RecurrentWM_RTX5090_Cert.lean`](proofs/examples/RecurrentWM_RTX5090_Cert.lean)).
 
 ## Contributing & License
 

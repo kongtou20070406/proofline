@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "proofline"
 version = "0.4.0"
-description = "Zero-GPU, formally verified hardware latency lower bounds (Roofline + Z3 + Lean 4) for PyTorch models."
+description = "Zero-GPU PyTorch Roofline profiler with machine-checked latency-bound certificates (Z3 + Lean 4) under an explicit idealized scheduling model."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
