@@ -27,6 +27,7 @@ import z3
 from .autodiff_bounds import ComputeDAG, evaluate_dag_bounds
 from .devices import GPU
 from .graph_rewrites import RewriteGroup, enumerate_rewrite_candidates
+from .microarch import evaluate_microarch_dag, fuse_stage_dag
 
 
 def _find_lean_bin() -> str | None:
@@ -346,6 +347,61 @@ end {ns}
     return out
 
 
+def prove_microarch_bound_z3(
+    dag: ComputeDAG,
+    device: GPU,
+    phase: str = "fwd",
+    eps_rel: float = 1e-6,
+    kv_cache_gb: float = 0.0,
+) -> dict[str, Any]:
+    """Formally certify all 5 microarchitecture physical walls via Z3 SMT (UNSAT + unsat_core)."""
+    fused = fuse_stage_dag(dag)
+    rep = evaluate_microarch_dag(fused, device, phase=phase, kv_cache_gb=kv_cache_gb)
+    t_floor_us = float(rep["T_microarch_floor_us"])
+
+    solver = z3.Solver()
+    solver.set(unsat_core=True)
+    T_uarch = z3.Real("T_microarch_us")
+    solver.assert_and_track(T_uarch >= 0, "non_negative_makespan")
+
+    # Wall 1: SM Wave Quantization (or TPU MXU systolic padding)
+    solver.assert_and_track(T_uarch >= _r(rep["T_wave_compute_us"]), "wall1_sm_wave_quantization")
+    # Wall 2: Three-Unit Execution Roofs (Tensor Core, FP32 ALU, SFU)
+    solver.assert_and_track(T_uarch >= _r(rep["T_tc_us"]), "wall2_three_unit_tensor_core")
+    solver.assert_and_track(T_uarch >= _r(rep["T_alu_us"]), "wall2_three_unit_alu")
+    solver.assert_and_track(T_uarch >= _r(rep["T_sfu_us"]), "wall2_three_unit_sfu")
+    # Wall 3: Three-Level Memory Roof
+    solver.assert_and_track(T_uarch >= _r(rep["T_mem_us"]), "wall3_memory_roof")
+    # Wall 4: Inter-SM Grid Sync vs. Cluster DSM + Serial Launch Ceiling
+    solver.assert_and_track(T_uarch >= _r(rep["T_sync_and_serial_us"]), "wall4_sync_and_serial_ceiling")
+    # Wall 5: Pigeonhole VRAM Capacity Overflow & Host PCIe Offload Ceiling
+    solver.assert_and_track(T_uarch >= _r(rep["T_offload_us"]), "offload_pigeonhole_ceiling")
+
+    strict_target = max(t_floor_us * (1.0 - eps_rel), 0.0)
+    solver.push()
+    if t_floor_us > 0.0:
+        solver.assert_and_track(T_uarch < _r(strict_target), "claim_beating_microarch_floor")
+        ref_res = solver.check()
+        core = [str(x) for x in solver.unsat_core()] if ref_res == z3.unsat else []
+    else:
+        ref_res = z3.unsat
+        core = ["zero_cost_graph"]
+    solver.pop()
+
+    solver.push()
+    solver.assert_and_track(T_uarch <= _r(t_floor_us * (1.0 + 1e-6)), "tight_upper_witness")
+    sat_res = solver.check()
+    solver.pop()
+
+    return {
+        **rep,
+        "z3_refutation_unsat": (ref_res == z3.unsat),
+        "z3_tight_witness_sat": (sat_res == z3.sat),
+        "proven": (ref_res == z3.unsat) and (sat_res == z3.sat),
+        "unsat_core": core,
+    }
+
+
 def prove_rewrite_family_z3(
     dag: ComputeDAG,
     device: GPU,
@@ -353,6 +409,7 @@ def prove_rewrite_family_z3(
     eps_rel: float = 1e-6,
 ) -> dict[str, Any]:
     """Optimize over R_exact via Z3 Optimize, then prove no valid rewrite+schedule beats T_rewrite_floor via Z3 UNSAT."""
+    dag = fuse_stage_dag(dag)
     norm_phase = "forward" if phase in ("fwd", "forward") else "train_store"
     ev = evaluate_dag_bounds(dag, device, phase=norm_phase)
     f_eff = float(device.peak_flops(dag.dtype))
@@ -430,7 +487,7 @@ def prove_rewrite_family_z3(
     s_rw_steps = float(model[S_opt].as_fraction())
 
     selected: dict[str, str] = {}
-    prescriptions: list[dict[str, Any]] = []
+    grouped_prescriptions: dict[tuple[str, str, str], dict[str, Any]] = {}
     for g, bvars in opt_choices:
         chosen_idx = 0
         for idx, bv in enumerate(bvars):
@@ -443,15 +500,31 @@ def prove_rewrite_family_z3(
             t_b = max(g.baseline.W_flops / f_eff, g.baseline.Q_bytes / bw, g.baseline.S_steps * tau_g) * 1e6
             t_c = max(cand.W_flops / f_eff, cand.Q_bytes / bw, cand.S_steps * tau_g) * 1e6
             delta_us = max(0.0, t_b - t_c)
-            prescriptions.append(
-                {
-                    "op": g.op_label,
+            op_sig = re.sub(r"#\d+", "", g.op_label)
+            key = (g.rule, op_sig, cand.variant)
+            if key not in grouped_prescriptions:
+                grouped_prescriptions[key] = {
+                    "op": op_sig,
                     "rule": g.rule,
                     "variant": cand.variant,
-                    "delta_us": round(delta_us, 4),
+                    "count": 1,
+                    "delta_us": delta_us,
+                    "total_delta_us": delta_us,
                     "reason": cand.reason,
                 }
-            )
+            else:
+                entry = grouped_prescriptions[key]
+                entry["count"] += 1
+                entry["delta_us"] += delta_us
+                entry["total_delta_us"] += delta_us
+
+    prescriptions: list[dict[str, Any]] = []
+    for entry in grouped_prescriptions.values():
+        entry["delta_us"] = round(entry["delta_us"], 4)
+        entry["total_delta_us"] = round(entry["total_delta_us"], 4)
+        if entry["count"] > 1:
+            entry["reason"] = f"{entry['reason']} (x{entry['count']})"
+        prescriptions.append(entry)
 
     # 2) Z3 UNSAT proof that NO rewrite choice in R_exact + schedule beats T_rewrite_floor * (1 - eps_rel)
     solver = z3.Solver()
@@ -612,3 +685,58 @@ end {ns}
         out["stdout"] = (res.stdout + "\n" + res.stderr).strip()
         out["verified"] = (res.returncode == 0)
     return out
+
+
+def prove_microarch_bound_z3(
+    dag: ComputeDAG,
+    device: GPU,
+    phase: str = "fwd",
+    eps_rel: float = 1e-6,
+    kv_cache_gb: float = 0.0,
+) -> dict[str, Any]:
+    """Formally certify all 5 microarchitecture physical walls via Z3 SMT (UNSAT + unsat_core)."""
+    fused = fuse_stage_dag(dag)
+    rep = evaluate_microarch_dag(fused, device, phase=phase, kv_cache_gb=kv_cache_gb)
+    t_floor_us = float(rep["T_microarch_floor_us"])
+
+    solver = z3.Solver()
+    solver.set(unsat_core=True)
+    T_uarch = z3.Real("T_microarch_us")
+    solver.assert_and_track(T_uarch >= 0, "non_negative_makespan")
+
+    # Wall 1: SM Wave Quantization (or TPU MXU systolic padding)
+    solver.assert_and_track(T_uarch >= _r(rep["T_wave_compute_us"]), "wall1_sm_wave_quantization")
+    # Wall 2: Three-Unit Execution Roofs (Tensor Core, FP32 ALU, SFU)
+    solver.assert_and_track(T_uarch >= _r(rep["T_tc_us"]), "wall2_three_unit_tensor_core")
+    solver.assert_and_track(T_uarch >= _r(rep["T_alu_us"]), "wall2_three_unit_alu")
+    solver.assert_and_track(T_uarch >= _r(rep["T_sfu_us"]), "wall2_three_unit_sfu")
+    # Wall 3: Three-Level Memory Roof
+    solver.assert_and_track(T_uarch >= _r(rep["T_mem_us"]), "wall3_memory_roof")
+    # Wall 4: Inter-SM Grid Sync vs. Cluster DSM + Serial Launch Ceiling
+    solver.assert_and_track(T_uarch >= _r(rep["T_sync_and_serial_us"]), "wall4_sync_and_serial_ceiling")
+    # Wall 5: Pigeonhole VRAM Capacity Overflow & Host PCIe Offload Ceiling
+    solver.assert_and_track(T_uarch >= _r(rep["T_offload_us"]), "offload_pigeonhole_ceiling")
+
+    strict_target = max(t_floor_us * (1.0 - eps_rel), 0.0)
+    solver.push()
+    if t_floor_us > 0.0:
+        solver.assert_and_track(T_uarch < _r(strict_target), "claim_beating_microarch_floor")
+        ref_res = solver.check()
+        core = [str(x) for x in solver.unsat_core()] if ref_res == z3.unsat else []
+    else:
+        ref_res = z3.unsat
+        core = ["zero_cost_graph"]
+    solver.pop()
+
+    solver.push()
+    solver.assert_and_track(T_uarch <= _r(t_floor_us * (1.0 + 1e-6)), "tight_upper_witness")
+    sat_res = solver.check()
+    solver.pop()
+
+    return {
+        **rep,
+        "z3_refutation_unsat": (ref_res == z3.unsat),
+        "z3_tight_witness_sat": (sat_res == z3.sat),
+        "proven": (ref_res == z3.unsat) and (sat_res == z3.sat),
+        "unsat_core": core,
+    }

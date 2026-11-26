@@ -40,6 +40,9 @@ def main() -> None:
     p.add_argument("--symbolic", default=None, help="print SymPy symbolic bounds for op (gemm|sdpa|recurrent_wm)")
     p.add_argument("--precision-sweep", action="store_true", help="sweep FP32/TF32/BF16/FP8/INT8/INT4 and 2:4 sparsity bounds")
     p.add_argument("--rewrite-opt", action="store_true", help="run exact algebraic rewrite family (R_exact) Z3 optimization & prescriptions")
+    p.add_argument("--compare-gpus", default=None, help="comma-separated list of GPU/TPU/Apple presets to compare")
+    p.add_argument("--microarch", action="store_true", help="include 5-wall microarchitecture breakdown and advice")
+    p.add_argument("--kv-cache-gb", type=float, default=0.0, help="KV cache size in GB for VRAM capacity / offload check")
     a = p.parse_args()
 
     from .calibrate import load_profile
@@ -73,7 +76,47 @@ def main() -> None:
         name = spec.split(":")[-1]
         models[name] = factory()
 
+    if a.compare_gpus:
+        from .microarch import compare_hardware, print_hardware_compare
+
+        gpu_keys = [k.strip() for k in a.compare_gpus.split(",") if k.strip()]
+        target_phase = "fwd" if a.phase in ("forward", "both") else "train"
+        for mname, mod in models.items():
+            rows = compare_hardware(mod, shape, gpus=gpu_keys, dtype=a.dtype, phase=target_phase, kv_cache_gb=a.kv_cache_gb)
+            print_hardware_compare(
+                rows,
+                title=f"\n[Microarch Hardware Compare] {mname} (input={shape}, dtype={a.dtype}, phase={target_phase})",
+                show_advice=a.microarch,
+            )
+        return
+
     print_compare(models, shape, gpu, use=a.use, dtype=a.dtype, phase=a.phase)
+
+    if a.microarch:
+        from .microarch import microarch_report
+
+        target_phase = "fwd" if a.phase in ("forward", "both") else "train"
+        for mname, mod in models.items():
+            rep = microarch_report(mod, shape, gpu=gpu, dtype=a.dtype, phase=target_phase, kv_cache_gb=a.kv_cache_gb)
+            print(
+                "\n[Microarch] %-16s T_uArch=%.2fus dominant=%s wave_eff=%.1f%% "
+                "(TC=%.2fus ALU=%.2fus SFU=%.2fus Mem=%.2fus Sync=%.2fus grid_sync=%d l2=%s)"
+                % (
+                    mname,
+                    rep["T_microarch_floor_us"],
+                    rep["dominant_wall"],
+                    rep["wave_efficiency"] * 100.0,
+                    rep["T_tc_us"],
+                    rep["T_alu_us"],
+                    rep["T_sfu_us"],
+                    rep["T_mem_us"],
+                    rep["T_sync_and_serial_us"],
+                    rep["grid_sync_stages"],
+                    rep["l2_resident"],
+                )
+            )
+            for adv in rep["advice"]:
+                print("  -> %s" % adv)
 
     if a.formal_z3 or a.emit_lean:
         from . import autodiff_bounds

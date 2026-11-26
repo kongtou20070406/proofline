@@ -97,14 +97,45 @@ pip install "proofline[formal] @ git+https://github.com/kongtou20070406/prooflin
 
 ## 内置硬件预设与实机标定
 
-| 预设名 | 设备 | FP32 峰值 | BF16 峰值 | 显存带宽 | $\tau_{\text{graph}} / \tau_{\text{eager}}$ |
-| --- | --- | ---: | ---: | ---: | ---: |
-| `rtx5090_measured` | NVIDIA RTX 5090（实测） | 95.0 TF | 195.7 TF | 1,508 GB/s | 0.93 / 10.32 $\mu$s |
-| `rtx5090` | NVIDIA RTX 5090（标称） | 104.8 TF | 209.5 TF | 1,792 GB/s | 0.93 / 10.32 $\mu$s |
-| `h100` | NVIDIA H100 SXM | 67.0 TF | 989.4 TF | 3,350 GB/s | 1.00 / 10.00 $\mu$s |
-| `a100` | NVIDIA A100 80GB | 19.5 TF | 312.0 TF | 2,039 GB/s | 1.20 / 10.00 $\mu$s |
+| 预设名 | 厂商 / 架构 | 核心单元数 | 显存 / 统一内存 | L2 / 缓存 | BF16 峰值 | 显存带宽 | 校准状态 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `rtx5090_measured` | NVIDIA `sm120` | 170 | 32 GB | 96 MB | 195.7 TF | 1,508 GB/s | **已实测** |
+| `b200` | NVIDIA `sm100` | 148 | 192 GB | 128 MB | 2,250.0 TF | 8,000 GB/s | 官方参数·未实测待验证 |
+| `h100` | NVIDIA `sm90` | 132 | 80 GB | 50 MB | 989.4 TF | 3,350 GB/s | 官方参数·未实测待验证 |
+| `a100` | NVIDIA `sm80` | 108 | 80 GB | 40 MB | 312.0 TF | 2,039 GB/s | 官方参数·未实测待验证 |
+| `l4` / `t4` | NVIDIA `sm89` / `sm75` | 58 / 40 | 24 / 16 GB | 48 / 4 MB | 121 / 65 TF | 300 / 320 GB/s | 官方参数·未实测待验证 |
+| `mi300x` / `mi325x` | AMD `cdna3` | 304 | 192 / 256 GB | 256 MB | 1,307.4 TF | 5,300 / 6,000 GB/s | 官方参数·未实测待验证 |
+| `tpu_v6e` / `tpu_v5p` | Google TPU | 2 / 8 MXUs | 31.25 / 95 GB | 64 / 128 MB | 918 / 459 TF | 1,638 / 2,765 GB/s | 官方参数·未实测待验证 |
+| `m3_ultra` / `m4_max` | Apple Silicon | 80 / 40 | 512 / 128 GB | 96 / 48 MB | 64 / 34 TF | 819 / 546 GB/s | 官方参数·未实测待验证 |
 
-可通过 `python -m proofline.cli --list-gpus` 查看全部预设，用 `proofline.GPU(...)` 自定义硬件参数，或在本机 GPU 上运行 `python -m proofline.measure_machine` 生成实测校准档。
+> **实测状态说明：** 当前仅 `rtx5090_measured` 完成过真实硬件标定，其余芯片均基于官方公开白皮书参数建模（**未实测，待实机验证**）。如果你手头有 H100、B200、MI300X 或 Apple Silicon 设备，跑一条 15 秒命令即可生成实测 JSON 档：
+
+```bash
+python -m proofline.measure_machine --json
+```
+
+## v4 微架构五堵物理墙与跨芯片横评（`--compare-gpus --microarch`）
+
+Proofline v4 在 Roofline + Z3 + Lean 4 中加入了**五堵硬件物理墙**：
+1. **SM 波次量化 / TPU 脉动阵列填充**：当 CTA 数不足或不是 $N_{\text{SM}}$ 整数倍时计入空转惩罚（TPU 上按 $128\times 128$ / $256\times 256$ MXU 对齐率计算）。
+2. **三单元执行上限**：把 FLOPs 拆进 **Tensor Core**、**FP32 ALU** 与 **SFU（`exp`/`rsqrt`/`softmax`/`gelu`）** 三条独立屋顶。
+3. **三级存储与片上分块**：纳入 `SMEM + TMEM` 分块容量、L2 / Infinity Cache / SLC 驻留与 HBM 带宽。
+4. **跨 SM 全局栅栏 vs. Cluster DSM**：工作集超出单 CTA / Cluster DSM 容量时强制计入跨 SM 同步延迟。
+5. **大模型显存溢出与主机内存搬运（`--kv-cache-gb`）**：支持零内存 `meta` 张量追踪大模型，超出可用显存时自动算出 PCIe offload 搬运下界与最小不溢出卡数（Apple 统一内存免除 PCIe 搬运）。
+
+`transformer_block`（`(1, 256, 512)`，`bf16`）跨芯片 `--compare-gpus` 实测输出：
+
+```text
+[Microarch Hardware Compare] transformer_block (input=(1, 256, 512), dtype=bf16, phase=fwd)
+Device            Arch     SMs   VRAM Fit? Offload(ms) T_uArch(us) T_wave(us)  T_mem(us) WaveEff  L2? Chips DominantWall 
+------------------------------------------------------------------------------------------------------------------------
+B200              sm100    148   192G yes         0.00      15.50       8.14       0.85   13.7% yes      1 grid_sync    
+H100              sm90     132    80G yes         0.00      26.50      16.51       2.04   15.4% yes      1 grid_sync    
+RTX5090-measured  sm120    170    32G yes         0.00     107.48     107.48       4.52   11.9% yes      1 wave_compute 
+MI300X            cdna3    304   192G yes         0.00      39.50      28.77       1.29    6.7% yes      1 grid_sync    
+TPU-v6e           tpu_v6e    2    31G yes         0.00       4.16       2.12       4.16   97.1% yes      1 memory       
+M3-Ultra          apple_m3   80   512G yes         0.00      61.00      51.12       8.33   58.5% yes      1 grid_sync    
+```
 
 ## 适用边界与 v3 扩展（多精度、L2 驻留与等价改图）
 

@@ -97,14 +97,45 @@ For local Lean 4 verification, install [Lean 4](https://leanprover.github.io/) (
 
 ## Built-in Hardware Presets & Calibration
 
-| Preset | Device | FP32 Peak | BF16 Peak | HBM Bandwidth | $\tau_{\text{graph}} / \tau_{\text{eager}}$ |
-| --- | --- | ---: | ---: | ---: | ---: |
-| `rtx5090_measured` | NVIDIA RTX 5090 (measured) | 95.0 TF | 195.7 TF | 1,508 GB/s | 0.93 / 10.32 $\mu$s |
-| `rtx5090` | NVIDIA RTX 5090 (spec) | 104.8 TF | 209.5 TF | 1,792 GB/s | 0.93 / 10.32 $\mu$s |
-| `h100` | NVIDIA H100 SXM | 67.0 TF | 989.4 TF | 3,350 GB/s | 1.00 / 10.00 $\mu$s |
-| `a100` | NVIDIA A100 80GB | 19.5 TF | 312.0 TF | 2,039 GB/s | 1.20 / 10.00 $\mu$s |
+| Preset | Vendor / Arch | SMs/CUs/MXUs | VRAM | L2 / Cache | BF16 Peak | HBM / Mem BW | Status |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `rtx5090_measured` | NVIDIA `sm120` | 170 | 32 GB | 96 MB | 195.7 TF | 1,508 GB/s | **Measured** |
+| `b200` | NVIDIA `sm100` | 148 | 192 GB | 128 MB | 2,250.0 TF | 8,000 GB/s | Spec (uncalibrated) |
+| `h100` | NVIDIA `sm90` | 132 | 80 GB | 50 MB | 989.4 TF | 3,350 GB/s | Spec (uncalibrated) |
+| `a100` | NVIDIA `sm80` | 108 | 80 GB | 40 MB | 312.0 TF | 2,039 GB/s | Spec (uncalibrated) |
+| `l4` / `t4` | NVIDIA `sm89` / `sm75` | 58 / 40 | 24 / 16 GB | 48 / 4 MB | 121 / 65 TF | 300 / 320 GB/s | Spec (uncalibrated) |
+| `mi300x` / `mi325x` | AMD `cdna3` | 304 | 192 / 256 GB | 256 MB | 1,307.4 TF | 5,300 / 6,000 GB/s | Spec (uncalibrated) |
+| `tpu_v6e` / `tpu_v5p` | Google TPU | 2 / 8 MXUs | 31.25 / 95 GB | 64 / 128 MB | 918 / 459 TF | 1,638 / 2,765 GB/s | Spec (uncalibrated) |
+| `m3_ultra` / `m4_max` | Apple Silicon | 80 / 40 | 512 / 128 GB | 96 / 48 MB | 64 / 34 TF | 819 / 546 GB/s | Spec (uncalibrated) |
 
-Run `python -m proofline.cli --list-gpus` for all presets, instantiate `proofline.GPU(...)` for custom ASICs/GPUs, or measure your local GPU directly with `python -m proofline.measure_machine`.
+> **Calibration status:** Only `rtx5090_measured` has been empirically calibrated on hardware; all other presets use published vendor specifications and await hardware verification. If you have access to H100, B200, MI300X, or Apple Silicon, run the 15-second `--json` calibration and share the output:
+
+```bash
+python -m proofline.measure_machine --json
+```
+
+## v4 Microarchitecture Walls & Cross-Hardware Comparison (`--compare-gpus --microarch`)
+
+Proofline v4 extends the formal Roofline + Z3 + Lean 4 engine with **five hardware physical walls**:
+1. **SM Wave Quantization / TPU MXU Padding**: Models idle SMs when CTA count is below $N_{\text{SM}}$ or not a multiple of $N_{\text{SM}}$ (and systolic $128\times 128$ / $256\times 256$ padding on TPUs).
+2. **Three-Unit Execution Roofs**: Splits FLOPs across **Tensor Core**, **FP32 ALU**, and **SFU** (`exp`/`rsqrt`/`softmax`/`gelu`).
+3. **Three-Level Memory Hierarchy**: Models on-chip `SMEM + TMEM` tiling, L2 / Infinity Cache / SLC residency, and HBM traffic.
+4. **Grid Sync vs. Cluster DSM Ceiling**: Charges inter-SM barriers when working sets exceed CTA/Cluster DSM capacity.
+5. **VRAM Overflow & PCIe Offload (`--kv-cache-gb`)**: For large models (even on zero-RAM `meta` tensors), proves the pigeonhole host-bus offload floor when `required_mem > usable_vram` alongside multi-chip `min_chips_no_offload`.
+
+Actual `--compare-gpus` output on `transformer_block` (`(1, 256, 512)`, `bf16`):
+
+```text
+[Microarch Hardware Compare] transformer_block (input=(1, 256, 512), dtype=bf16, phase=fwd)
+Device            Arch     SMs   VRAM Fit? Offload(ms) T_uArch(us) T_wave(us)  T_mem(us) WaveEff  L2? Chips DominantWall 
+------------------------------------------------------------------------------------------------------------------------
+B200              sm100    148   192G yes         0.00      15.50       8.14       0.85   13.7% yes      1 grid_sync    
+H100              sm90     132    80G yes         0.00      26.50      16.51       2.04   15.4% yes      1 grid_sync    
+RTX5090-measured  sm120    170    32G yes         0.00     107.48     107.48       4.52   11.9% yes      1 wave_compute 
+MI300X            cdna3    304   192G yes         0.00      39.50      28.77       1.29    6.7% yes      1 grid_sync    
+TPU-v6e           tpu_v6e    2    31G yes         0.00       4.16       2.12       4.16   97.1% yes      1 memory       
+M3-Ultra          apple_m3   80   512G yes         0.00      61.00      51.12       8.33   58.5% yes      1 grid_sync    
+```
 
 ## Caveats & v3 Extensions (Precision, L2 Residency & Exact Rewrites)
 

@@ -86,6 +86,8 @@ def _matmul_chain_groups(
     for i, node in enumerate(nodes):
         if i in visited or i in used_nodes or not _is_pure_chain_gemm(node):
             continue
+        if node.attrs.get("has_fused_nonlinearity", False):
+            continue
         # Walk forward along single-child linear chain
         chain = [node]
         cur = node
@@ -95,6 +97,7 @@ def _matmul_chain_groups(
             if (
                 nxt_id in used_nodes
                 or not _is_pure_chain_gemm(nxt)
+                or nxt.attrs.get("has_fused_ext_merge", False)
                 or len(nxt.parents) != 1
                 or int(nxt.attrs["k"]) != int(cur.attrs["n"])
                 or int(nxt.attrs.get("batch", 1)) != int(cur.attrs.get("batch", 1))
@@ -102,6 +105,8 @@ def _matmul_chain_groups(
                 break
             chain.append(nxt)
             cur = nxt
+            if nxt.attrs.get("has_fused_nonlinearity", False):
+                break
 
         if len(chain) < 2:
             continue
@@ -353,12 +358,15 @@ def enumerate_rewrite_candidates(
     device: GPU,
     phase: str = "fwd",
 ) -> list[RewriteGroup]:
-    """Enumerate all exact algebraic equivalence rewrite groups on a ComputeDAG."""
-    b_elem = int(max(1, math.ceil(dtype_bytes(dag.dtype))))
+    """Enumerate all exact algebraic equivalence rewrite groups on a stage-fused ComputeDAG."""
+    from .microarch import fuse_stage_dag
+
+    fused = fuse_stage_dag(dag)
+    b_elem = int(max(1, math.ceil(dtype_bytes(fused.dtype))))
     used_nodes: set[int] = set()
     groups: list[RewriteGroup] = []
-    groups.extend(_matmul_chain_groups(dag, device, used_nodes, b_elem))
-    groups.extend(_shared_input_linear_groups(dag, device, used_nodes, b_elem))
-    groups.extend(_conv_winograd_fft_groups(dag, device, used_nodes, b_elem))
-    groups.extend(_remat_tradeoff_groups(dag, phase))
+    groups.extend(_matmul_chain_groups(fused, device, used_nodes, b_elem))
+    groups.extend(_shared_input_linear_groups(fused, device, used_nodes, b_elem))
+    groups.extend(_conv_winograd_fft_groups(fused, device, used_nodes, b_elem))
+    groups.extend(_remat_tradeoff_groups(fused, phase))
     return groups

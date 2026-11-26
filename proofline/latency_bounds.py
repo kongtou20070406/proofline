@@ -440,6 +440,9 @@ def phase_report(
         "l2_capacity_mb": l2_cap / 1e6,
         "T_l2_resident_us": t_l2_fwd * 1e6,
         "T_l2_resident_abs_us": t_l2_abs * 1e6,
+        "unique_param_bytes": param_bytes_dt,
+        "total_param_bytes": param_bytes_dt,
+        "param_reuse_factor": 1.0,
     }
 
 

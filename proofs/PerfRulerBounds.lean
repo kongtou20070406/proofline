@@ -906,4 +906,50 @@ theorem nsi_unfused_witness :
 #print axioms nsi_hbm_serial_bounds
 #print axioms nsi_unfused_witness
 
+/-! ## Proofline v4: Three-Unit Execution Roofs & SM Wave Quantization Ceilings -/
+
+structure ThreeUnitDevice where
+  tcPeak : Nat
+  aluPeak : Nat
+  sfuPeak : Nat
+  tc_pos : 0 < tcPeak
+  alu_pos : 0 < aluPeak
+  sfu_pos : 0 < sfuPeak
+
+structure ThreeUnitWork where
+  tcWork : Nat
+  aluWork : Nat
+  sfuWork : Nat
+
+structure ThreeUnitSchedule (w : ThreeUnitWork) (d : ThreeUnitDevice) where
+  T : Nat
+  tcBound : w.tcWork ≤ d.tcPeak * T
+  aluBound : w.aluWork ≤ d.aluPeak * T
+  sfuBound : w.sfuWork ≤ d.sfuPeak * T
+
+def threeUnitTicks (w : ThreeUnitWork) (d : ThreeUnitDevice) : Nat :=
+  max (ceilTicks w.tcWork d.tcPeak)
+      (max (ceilTicks w.aluWork d.aluPeak) (ceilTicks w.sfuWork d.sfuPeak))
+
+theorem three_unit_lower_bound {w : ThreeUnitWork} {d : ThreeUnitDevice}
+    (s : ThreeUnitSchedule w d) : threeUnitTicks w d ≤ s.T := by
+  exact Nat.max_le.mpr
+    ⟨(ceilTicks_le d.tc_pos).2 s.tcBound,
+     Nat.max_le.mpr ⟨(ceilTicks_le d.alu_pos).2 s.aluBound, (ceilTicks_le d.sfu_pos).2 s.sfuBound⟩⟩
+
+def waveCount (nCta smCount : Nat) : Nat := ceilTicks nCta smCount
+
+theorem wave_quantization_lower_bound {nCta smCount T : Nat} (hsm : 0 < smCount)
+    (hcov : nCta ≤ smCount * T) : waveCount nCta smCount ≤ T := by
+  exact (ceilTicks_le hsm).2 hcov
+
+theorem offload_pigeonhole_lower_bound {reqMem capMem hostBw T : Nat} (hbw : 0 < hostBw)
+    (hspill : reqMem - capMem ≤ hostBw * T) :
+    ceilTicks (reqMem - capMem) hostBw ≤ T := by
+  exact (ceilTicks_le hbw).2 hspill
+
+#print axioms three_unit_lower_bound
+#print axioms wave_quantization_lower_bound
+#print axioms offload_pigeonhole_lower_bound
+
 end PerfRuler

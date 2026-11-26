@@ -77,10 +77,39 @@ class GPU:
     F_fp4: float | None = None
     sparse_24_multiplier: float = 2.0
     l2_bw_gbs: float | None = None
+    arch: str = "generic"
+    sm_count: int = 1
+    smem_per_sm_kb: float = 128.0
+    regfile_per_sm_kb: float = 256.0
+    tmem_per_sm_kb: float = 0.0
+    cluster_max_sms: int = 1
+    F_sfu: float | None = None
+    tau_grid_sync_us: float = 2.0
+    tau_cluster_sync_us: float = 0.25
+    supports_bf16: bool = True
+    supports_fp8: bool = True
+    supports_fp4: bool = False
+    vendor: str = "nvidia"
+    mxu_dim: int = 0
+    vram_gb: float = 80.0
+    host_bw_gbs: float = 56.0
+    interconnect_bw_gbs: float = 0.0
+    unified_memory: bool = False
 
     @property
     def l2_bytes(self) -> float:
         return float(self.sram_bytes)
+
+    def sfu_flops(self) -> float:
+        """Return Special Function Unit (exp/rsqrt/sin/cos/tanh) peak FLOP/s."""
+        if self.F_sfu is not None:
+            return float(self.F_sfu)
+        fp32_peak = self.F_fp32 if self.F_fp32 is not None else self.F / 2.0
+        if self.arch in ("sm89", "sm90", "sm100", "sm120"):
+            return float(fp32_peak * 4.0 / 128.0)
+        if self.arch in ("sm75", "sm80"):
+            return float(fp32_peak * 4.0 / 64.0)
+        return float(fp32_peak / 16.0)
 
     def peak_flops(self, dtype: Any = None, sparse_24: bool = False) -> float:
         """Return effective peak FLOP/s for the target precision and optional 2:4 sparsity."""
@@ -154,48 +183,157 @@ GPU_PRESETS = {
         tau_graph=1.50e-6, tau_eager=10.0e-6, sram_bytes=4e6, sm_sram_bytes=64 * 1024.0,
         F_tf32=8.1e12, F_fp8=65.0e12, F_int8=130.0e12, F_fp4=260.0e12,
         sparse_24_multiplier=1.0, l2_bw_gbs=1200.0,
+        arch="sm75", sm_count=40, smem_per_sm_kb=64.0, regfile_per_sm_kb=256.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=1,
+        supports_bf16=False, supports_fp8=False, supports_fp4=False,
+        vram_gb=16.0, host_bw_gbs=12.5, interconnect_bw_gbs=12.5,
+    ),
+    "l4": GPU(
+        "L4", 121.0e12, 300e9, 10.0e-6, F_fp32=30.3e12,
+        tau_graph=1.20e-6, tau_eager=10.0e-6, sram_bytes=48e6, sm_sram_bytes=128 * 1024.0,
+        F_tf32=60.5e12, F_fp8=242.5e12, F_int8=242.5e12, F_fp4=242.5e12,
+        sparse_24_multiplier=2.0, l2_bw_gbs=1800.0,
+        arch="sm89", sm_count=58, smem_per_sm_kb=128.0, regfile_per_sm_kb=256.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=1,
+        supports_bf16=True, supports_fp8=True, supports_fp4=False,
+        vram_gb=24.0, host_bw_gbs=26.0, interconnect_bw_gbs=26.0,
     ),
     "rtx4090": GPU(
         "RTX4090", 165.2e12, 1008e9, 10.0e-6, F_fp32=82.6e12,
         tau_graph=1.00e-6, tau_eager=10.0e-6, sram_bytes=72e6, sm_sram_bytes=128 * 1024.0,
         F_tf32=82.6e12, F_fp8=330.3e12, F_int8=330.3e12, F_fp4=330.3e12,
         sparse_24_multiplier=2.0, l2_bw_gbs=4500.0,
+        arch="sm89", sm_count=128, smem_per_sm_kb=128.0, regfile_per_sm_kb=256.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=1,
+        supports_bf16=True, supports_fp8=True, supports_fp4=False,
+        vram_gb=24.0, host_bw_gbs=26.0, interconnect_bw_gbs=26.0,
     ),
     "rtx5090": GPU(
         "RTX5090", 209.5e12, 1792e9, 10.32e-6, F_fp32=104.8e12,
-        tau_graph=0.93e-6, tau_eager=10.32e-6, sram_bytes=96e6, sm_sram_bytes=128 * 1024.0,
+        tau_graph=0.93e-6, tau_eager=10.32e-6, sram_bytes=96e6, sm_sram_bytes=228 * 1024.0,
         F_tf32=104.8e12, F_fp8=419.0e12, F_int8=419.0e12, F_fp4=838.0e12,
         sparse_24_multiplier=2.0, l2_bw_gbs=6500.0,
+        arch="sm120", sm_count=170, smem_per_sm_kb=228.0, regfile_per_sm_kb=256.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=4,
+        supports_bf16=True, supports_fp8=True, supports_fp4=True,
+        vram_gb=32.0, host_bw_gbs=56.0, interconnect_bw_gbs=56.0,
     ),
     "rtx5090_measured": GPU(
         "RTX5090-measured", 195.7e12, 1508e9, 10.32e-6, F_fp32=95.0e12,
-        tau_graph=0.93e-6, tau_eager=10.32e-6, sram_bytes=96e6, sm_sram_bytes=128 * 1024.0,
+        tau_graph=0.93e-6, tau_eager=10.32e-6, sram_bytes=96e6, sm_sram_bytes=228 * 1024.0,
         F_tf32=95.0e12, F_fp8=391.4e12, F_int8=391.4e12, F_fp4=782.8e12,
         sparse_24_multiplier=2.0, l2_bw_gbs=6000.0,
+        arch="sm120", sm_count=170, smem_per_sm_kb=228.0, regfile_per_sm_kb=256.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=4,
+        supports_bf16=True, supports_fp8=True, supports_fp4=True,
+        vram_gb=32.0, host_bw_gbs=56.0, interconnect_bw_gbs=56.0,
     ),
     "a100": GPU(
         "A100-80G", 312.0e12, 2039e9, 10.0e-6, F_fp32=19.5e12,
         tau_graph=1.20e-6, tau_eager=10.0e-6, sram_bytes=40e6, sm_sram_bytes=164 * 1024.0,
         F_tf32=156.0e12, F_fp8=312.0e12, F_int8=624.0e12, F_fp4=624.0e12,
         sparse_24_multiplier=2.0, l2_bw_gbs=5000.0,
+        arch="sm80", sm_count=108, smem_per_sm_kb=164.0, regfile_per_sm_kb=256.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=1,
+        supports_bf16=True, supports_fp8=False, supports_fp4=False,
+        vram_gb=80.0, host_bw_gbs=26.0, interconnect_bw_gbs=300.0,
     ),
     "h100": GPU(
         "H100", 989.4e12, 3350e9, 10.0e-6, F_fp32=67.0e12,
         tau_graph=1.00e-6, tau_eager=10.0e-6, sram_bytes=50e6, sm_sram_bytes=228 * 1024.0,
         F_tf32=494.7e12, F_fp8=1978.9e12, F_int8=1978.9e12, F_fp4=1978.9e12,
         sparse_24_multiplier=2.0, l2_bw_gbs=12000.0,
+        arch="sm90", sm_count=132, smem_per_sm_kb=228.0, regfile_per_sm_kb=256.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=8,
+        supports_bf16=True, supports_fp8=True, supports_fp4=False,
+        vram_gb=80.0, host_bw_gbs=56.0, interconnect_bw_gbs=450.0,
+    ),
+    "b200": GPU(
+        "B200", 2250.0e12, 8000e9, 10.0e-6, F_fp32=80.0e12,
+        tau_graph=0.80e-6, tau_eager=10.0e-6, sram_bytes=128e6, sm_sram_bytes=228 * 1024.0,
+        F_tf32=1125.0e12, F_fp8=4500.0e12, F_int8=4500.0e12, F_fp4=9000.0e12,
+        sparse_24_multiplier=2.0, l2_bw_gbs=10000.0,
+        arch="sm100", sm_count=148, smem_per_sm_kb=228.0, regfile_per_sm_kb=256.0,
+        tmem_per_sm_kb=256.0, cluster_max_sms=8,
+        supports_bf16=True, supports_fp8=True, supports_fp4=True,
+        vram_gb=192.0, host_bw_gbs=56.0, interconnect_bw_gbs=900.0,
     ),
     "tpu_v5p": GPU(
-        "TPU-v5p", 459.0e12, 2765e9, 5.0e-6, F_fp32=115.0e12,
-        tau_graph=0.80e-6, tau_eager=5.0e-6, sram_bytes=96e6, sm_sram_bytes=16 * 1024.0 * 1024.0,
-        F_tf32=229.5e12, F_fp8=918.0e12, F_int8=918.0e12, F_fp4=918.0e12,
+        "TPU-v5p", 459.0e12, 2765e9, 2.0e-6, F_fp32=229.5e12,
+        tau_graph=0.15e-6, tau_eager=2.0e-6, sram_bytes=128e6, sm_sram_bytes=16 * 1024.0 * 1024.0,
+        F_tf32=229.5e12, F_fp8=459.0e12, F_int8=918.0e12, F_fp4=918.0e12,
+        sparse_24_multiplier=1.0, l2_bw_gbs=12000.0,
+        arch="tpu_v5p", sm_count=8, smem_per_sm_kb=16384.0, regfile_per_sm_kb=1024.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=1, tau_grid_sync_us=0.20,
+        supports_bf16=True, supports_fp8=True, supports_fp4=False,
+        vendor="google", mxu_dim=128,
+        vram_gb=95.0, host_bw_gbs=32.0, interconnect_bw_gbs=600.0,
+    ),
+    "tpu_v6e": GPU(
+        "TPU-v6e", 918.0e12, 1638e9, 2.0e-6, F_fp32=459.0e12,
+        tau_graph=0.15e-6, tau_eager=2.0e-6, sram_bytes=64e6, sm_sram_bytes=16 * 1024.0 * 1024.0,
+        F_tf32=459.0e12, F_fp8=1836.0e12, F_int8=1836.0e12, F_fp4=1836.0e12,
         sparse_24_multiplier=1.0, l2_bw_gbs=10000.0,
+        arch="tpu_v6e", sm_count=2, smem_per_sm_kb=16384.0, regfile_per_sm_kb=1024.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=1, tau_grid_sync_us=0.20,
+        supports_bf16=True, supports_fp8=True, supports_fp4=False,
+        vendor="google", mxu_dim=256,
+        vram_gb=31.25, host_bw_gbs=32.0, interconnect_bw_gbs=400.0,
+    ),
+    "mi300x": GPU(
+        "MI300X", 1307.4e12, 5300e9, 12.0e-6, F_fp32=163.4e12,
+        tau_graph=1.20e-6, tau_eager=12.0e-6, sram_bytes=256e6, sm_sram_bytes=64 * 1024.0,
+        F_tf32=653.7e12, F_fp8=2614.9e12, F_int8=2614.9e12, F_fp4=2614.9e12,
+        sparse_24_multiplier=2.0, l2_bw_gbs=12000.0,
+        arch="cdna3", sm_count=304, smem_per_sm_kb=64.0, regfile_per_sm_kb=256.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=1, tau_grid_sync_us=2.5,
+        supports_bf16=True, supports_fp8=True, supports_fp4=False,
+        vendor="amd", mxu_dim=0,
+        vram_gb=192.0, host_bw_gbs=56.0, interconnect_bw_gbs=448.0,
+    ),
+    "mi325x": GPU(
+        "MI325X", 1307.4e12, 6000e9, 12.0e-6, F_fp32=163.4e12,
+        tau_graph=1.20e-6, tau_eager=12.0e-6, sram_bytes=256e6, sm_sram_bytes=64 * 1024.0,
+        F_tf32=653.7e12, F_fp8=2614.9e12, F_int8=2614.9e12, F_fp4=2614.9e12,
+        sparse_24_multiplier=2.0, l2_bw_gbs=12000.0,
+        arch="cdna3", sm_count=304, smem_per_sm_kb=64.0, regfile_per_sm_kb=256.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=1, tau_grid_sync_us=2.5,
+        supports_bf16=True, supports_fp8=True, supports_fp4=False,
+        vendor="amd", mxu_dim=0,
+        vram_gb=256.0, host_bw_gbs=56.0, interconnect_bw_gbs=448.0,
+    ),
+    "m4_max": GPU(
+        "M4-Max", 34.0e12, 546e9, 15.0e-6, F_fp32=17.0e12,
+        tau_graph=2.50e-6, tau_eager=15.0e-6, sram_bytes=48e6, sm_sram_bytes=32 * 1024.0,
+        F_tf32=17.0e12, F_fp8=34.0e12, F_int8=68.0e12, F_fp4=68.0e12,
+        sparse_24_multiplier=1.0, l2_bw_gbs=1800.0,
+        arch="apple_m4", sm_count=40, smem_per_sm_kb=32.0, regfile_per_sm_kb=256.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=1, tau_grid_sync_us=3.0,
+        supports_bf16=True, supports_fp8=False, supports_fp4=False,
+        vendor="apple", mxu_dim=0,
+        vram_gb=128.0, host_bw_gbs=546.0, interconnect_bw_gbs=546.0, unified_memory=True,
+    ),
+    "m3_ultra": GPU(
+        "M3-Ultra", 64.0e12, 819e9, 15.0e-6, F_fp32=32.0e12,
+        tau_graph=2.50e-6, tau_eager=15.0e-6, sram_bytes=96e6, sm_sram_bytes=32 * 1024.0,
+        F_tf32=32.0e12, F_fp8=64.0e12, F_int8=128.0e12, F_fp4=128.0e12,
+        sparse_24_multiplier=1.0, l2_bw_gbs=2600.0,
+        arch="apple_m3", sm_count=80, smem_per_sm_kb=32.0, regfile_per_sm_kb=256.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=1, tau_grid_sync_us=3.0,
+        supports_bf16=True, supports_fp8=False, supports_fp4=False,
+        vendor="apple", mxu_dim=0,
+        vram_gb=512.0, host_bw_gbs=819.0, interconnect_bw_gbs=819.0, unified_memory=True,
     ),
     "cpu_avx512": GPU(
         "CPU-EPYC-9654", 5.5e12, 460e9, 15.0e-6, F_fp32=2.75e12,
         tau_graph=2.0e-6, tau_eager=15.0e-6, sram_bytes=384e6, sm_sram_bytes=1024 * 1024.0,
         F_tf32=2.75e12, F_fp8=5.5e12, F_int8=11.0e12, F_fp4=11.0e12,
         sparse_24_multiplier=1.0, l2_bw_gbs=2000.0,
+        arch="avx512", sm_count=96, smem_per_sm_kb=1024.0, regfile_per_sm_kb=64.0,
+        tmem_per_sm_kb=0.0, cluster_max_sms=1,
+        supports_bf16=True, supports_fp8=False, supports_fp4=False,
+        vendor="cpu", mxu_dim=0,
+        vram_gb=256.0, host_bw_gbs=460.0, interconnect_bw_gbs=460.0, unified_memory=True,
     ),
 }
 

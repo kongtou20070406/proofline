@@ -18,6 +18,7 @@ import torch
 
 from .autodiff_bounds import ComputeDAG, OpNode, dag_from_torch_module
 from .devices import GPU, _dtype_key, dtype_bytes
+from .microarch import fuse_stage_dag
 
 _SENSITIVE_OPS = (
     "layer_norm",
@@ -228,7 +229,7 @@ def precision_sweep(
         else:
             specs.append(PrecisionSpec(str(item)))
 
-    dag = dag_from_torch_module(model, sample_input, dtype="fp32", gpu=gpu)
+    dag = fuse_stage_dag(dag_from_torch_module(model, sample_input, dtype="fp32", gpu=gpu))
     results = [_evaluate_precision_spec(dag, sp, gpu) for sp in specs]
 
     # Compute speedup relative to fp32 baseline (or first entry if fp32 not in list)
