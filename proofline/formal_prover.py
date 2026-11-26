@@ -26,6 +26,7 @@ import z3
 
 from .autodiff_bounds import ComputeDAG, evaluate_dag_bounds
 from .devices import GPU
+from .graph_rewrites import RewriteGroup, enumerate_rewrite_candidates
 
 
 def _find_lean_bin() -> str | None:
@@ -325,6 +326,274 @@ end {ns}
         "certified_ns": t_floor_ns,
         "witness_ns": t_star_ns,
         "binding": ev["binding"],
+        "verified": False,
+        "exit_code": None,
+        "stdout": "",
+    }
+    if verify:
+        lean_bin = _find_lean_bin()
+        if not lean_bin:
+            out["stdout"] = "lean binary not found in PATH (set PROOFLINE_LEAN_BIN to verify locally)"
+            return out
+        res = subprocess.run(
+            [lean_bin, "-DwarningAsError=true", out_path],
+            capture_output=True,
+            text=True,
+        )
+        out["exit_code"] = res.returncode
+        out["stdout"] = (res.stdout + "\n" + res.stderr).strip()
+        out["verified"] = (res.returncode == 0)
+    return out
+
+
+def prove_rewrite_family_z3(
+    dag: ComputeDAG,
+    device: GPU,
+    phase: str = "fwd",
+    eps_rel: float = 1e-6,
+) -> dict[str, Any]:
+    """Optimize over R_exact via Z3 Optimize, then prove no valid rewrite+schedule beats T_rewrite_floor via Z3 UNSAT."""
+    norm_phase = "forward" if phase in ("fwd", "forward") else "train_store"
+    ev = evaluate_dag_bounds(dag, device, phase=norm_phase)
+    f_eff = float(device.peak_flops(dag.dtype))
+    bw = float(device.BW)
+    tau_g = float(device.tau_graph)
+
+    w_base_flops = float(ev["W_tot_GFLOP"]) * 1e9
+    q_base_bytes = max(float(ev["Q_min_io_MB"]), float(ev["Q_hk_MB"])) * 1e6
+    s_base_steps = float(ev["S_crit_tot"])
+    t_base_us = float(ev["T_abs_floor_us"])
+    q_compulsory_floor = max(dag.input_bytes + dag.output_bytes + min(dag.param_bytes, q_base_bytes), 0.0)
+
+    groups: list[RewriteGroup] = enumerate_rewrite_candidates(dag, device, phase=norm_phase)
+
+    def _build_constraints(ctx_add, is_optimize: bool):
+        T_tot = z3.Real("T_rewrite_us")
+        W_tot = z3.Real("W_tot_flops")
+        Q_tot = z3.Real("Q_tot_bytes")
+        S_tot = z3.Real("S_tot_steps")
+
+        ctx_add(T_tot >= 0, "non_negative_makespan")
+        ctx_add(W_tot >= 0, "non_negative_work")
+        ctx_add(Q_tot >= _r(q_compulsory_floor), "compulsory_io_floor")
+        ctx_add(S_tot >= _r(1.0 if dag.nodes else 0.0), "non_empty_serial_floor")
+
+        choice_vars: list[tuple[RewriteGroup, list[z3.BoolRef]]] = []
+        dw_terms = []
+        dq_terms = []
+        ds_terms = []
+
+        for g in groups:
+            bvars = [z3.Bool(f"rw_{g.group_id}_{idx}") for idx in range(len(g.candidates))]
+            choice_vars.append((g, bvars))
+            # Exactly one variant selected in this equivalence group
+            ctx_add(z3.PbEq([(bv, 1) for bv in bvars], 1), f"choose_one_{g.group_id}")
+            for bv, cand in zip(bvars, g.candidates):
+                if not cand.valid:
+                    ctx_add(z3.Not(bv), f"invalid_{g.group_id}_{cand.variant}")
+                dw = cand.W_flops - g.baseline.W_flops
+                dq = cand.Q_bytes - g.baseline.Q_bytes
+                ds = cand.S_steps - g.baseline.S_steps
+                if abs(dw) > 0.0:
+                    dw_terms.append(z3.If(bv, _r(dw), z3.RealVal(0)))
+                if abs(dq) > 0.0:
+                    dq_terms.append(z3.If(bv, _r(dq), z3.RealVal(0)))
+                if abs(ds) > 0.0:
+                    ds_terms.append(z3.If(bv, _r(ds), z3.RealVal(0)))
+
+        w_expr = _r(w_base_flops) + (z3.Sum(dw_terms) if dw_terms else z3.RealVal(0))
+        q_expr = _r(q_base_bytes) + (z3.Sum(dq_terms) if dq_terms else z3.RealVal(0))
+        s_expr = _r(s_base_steps) + (z3.Sum(ds_terms) if ds_terms else z3.RealVal(0))
+
+        ctx_add(W_tot == w_expr, "rewrite_work_balance")
+        ctx_add(Q_tot >= q_expr, "rewrite_traffic_balance")
+        ctx_add(S_tot >= s_expr, "rewrite_serial_balance")
+
+        # Hardware speed-limit inequalities in microseconds
+        ctx_add(T_tot >= W_tot * _r(1e6 / f_eff), "rewrite_compute_ceiling")
+        ctx_add(T_tot >= Q_tot * _r(1e6 / bw), "rewrite_memory_ceiling")
+        ctx_add(T_tot >= S_tot * _r(tau_g * 1e6), "rewrite_serial_ceiling")
+        return T_tot, W_tot, Q_tot, S_tot, choice_vars
+
+    # 1) Z3 Optimize to find T_rewrite_floor and winning rewrite assignment
+    opt = z3.Optimize()
+    T_opt, W_opt, Q_opt, S_opt, opt_choices = _build_constraints(lambda c, _n: opt.add(c), is_optimize=True)
+    opt.minimize(T_opt)
+    opt_res = opt.check()
+    if opt_res != z3.sat:
+        raise RuntimeError(f"Z3 Optimize failed on rewrite family: {opt_res}")
+
+    model = opt.model()
+    t_rw_us = float(model[T_opt].as_fraction())
+    w_rw_flops = float(model[W_opt].as_fraction())
+    q_rw_bytes = float(model[Q_opt].as_fraction())
+    s_rw_steps = float(model[S_opt].as_fraction())
+
+    selected: dict[str, str] = {}
+    prescriptions: list[dict[str, Any]] = []
+    for g, bvars in opt_choices:
+        chosen_idx = 0
+        for idx, bv in enumerate(bvars):
+            if z3.is_true(model.evaluate(bv, model_completion=True)):
+                chosen_idx = idx
+                break
+        cand = g.candidates[chosen_idx]
+        selected[g.group_id] = cand.variant
+        if cand.variant != g.baseline.variant:
+            t_b = max(g.baseline.W_flops / f_eff, g.baseline.Q_bytes / bw, g.baseline.S_steps * tau_g) * 1e6
+            t_c = max(cand.W_flops / f_eff, cand.Q_bytes / bw, cand.S_steps * tau_g) * 1e6
+            delta_us = max(0.0, t_b - t_c)
+            prescriptions.append(
+                {
+                    "op": g.op_label,
+                    "rule": g.rule,
+                    "variant": cand.variant,
+                    "delta_us": round(delta_us, 4),
+                    "reason": cand.reason,
+                }
+            )
+
+    # 2) Z3 UNSAT proof that NO rewrite choice in R_exact + schedule beats T_rewrite_floor * (1 - eps_rel)
+    solver = z3.Solver()
+    solver.set(unsat_core=True)
+    T_ref, _, _, _, _ = _build_constraints(lambda c, name: solver.assert_and_track(c, name), is_optimize=False)
+    strict_target = max(t_rw_us * (1.0 - eps_rel), 0.0)
+    if t_rw_us > 0.0:
+        solver.assert_and_track(T_ref < _r(strict_target), "claim_beating_rewrite_floor")
+        ref_res = solver.check()
+        core = [str(x) for x in solver.unsat_core()] if ref_res == z3.unsat else []
+    else:
+        ref_res = z3.unsat
+        core = ["zero_cost_graph"]
+
+    return {
+        "model": dag.name,
+        "device": device.name,
+        "dtype": dag.dtype,
+        "phase": phase,
+        "T_baseline_us": t_base_us,
+        "T_rewrite_floor_us": t_rw_us,
+        "speedup_vs_baseline": (t_base_us / t_rw_us) if t_rw_us > 0 else 1.0,
+        "W_rewrite_GFLOP": w_rw_flops / 1e9,
+        "Q_rewrite_MB": q_rw_bytes / 1e6,
+        "S_rewrite_steps": s_rw_steps,
+        "n_rewrite_groups": len(groups),
+        "selected_rewrites": selected,
+        "prescriptions": prescriptions,
+        "z3_refutation_unsat": (ref_res == z3.unsat),
+        "proven": (ref_res == z3.unsat),
+        "unsat_core": core,
+    }
+
+
+def emit_rewrite_lean4_certificate(
+    dag: ComputeDAG,
+    device: GPU,
+    out_path: str,
+    phase: str = "fwd",
+    verify: bool = False,
+) -> dict[str, Any]:
+    """Emit a standalone Lean 4 (`import Std`) certificate for the R_exact rewrite floor."""
+    cert = prove_rewrite_family_z3(dag, device, phase=phase)
+    f_gflops = max(1, int(round(float(device.peak_flops(dag.dtype)) / 1e9)))
+    bw_gbps = max(1, int(round(float(device.BW) / 1e9)))
+    tau_ns = max(1, int(round(float(device.tau_graph) * 1e9)))
+
+    w_mflops = int(math.floor(float(cert["W_rewrite_GFLOP"]) * 1000.0))
+    w_flops = w_mflops * 1_000_000
+    q_kb = int(math.floor(float(cert["Q_rewrite_MB"]) * 1000.0))
+    q_bytes = q_kb * 1000
+    s_crit = int(math.floor(float(cert["S_rewrite_steps"])))
+
+    t_comp_floor = w_flops // f_gflops
+    t_mem_floor = q_bytes // bw_gbps
+    t_ser_floor = s_crit * tau_ns
+    t_floor_ns = max(t_comp_floor, t_mem_floor, t_ser_floor)
+    t_star_ns = max(
+        (w_flops + f_gflops - 1) // f_gflops if w_flops > 0 else 0,
+        (q_bytes + bw_gbps - 1) // bw_gbps if q_bytes > 0 else 0,
+        s_crit * tau_ns,
+    )
+
+    ns = _safe_ident(f"Rewrite_{dag.name}_{device.name}_{phase}")
+    lean_code = f"""import Std
+
+/-!
+Auto-generated formal R_exact rewrite speed-limit certificate by `Proofline v3`.
+Model  : {dag.name}
+Device : {device.name} (dtype={dag.dtype}, F={f_gflops} GFLOP/s, BW={bw_gbps} GB/s, tau={tau_ns} ns)
+Phase  : {phase}
+Groups : {cert["n_rewrite_groups"]}
+-/
+
+namespace {ns}
+
+def peakFlopsPerNs : Nat := {f_gflops}
+def bwBytesPerNs   : Nat := {bw_gbps}
+def tauNs          : Nat := {tau_ns}
+
+def rewriteWorkFlops    : Nat := {w_flops}
+def rewriteTrafficBytes : Nat := {q_bytes}
+def rewriteCritSteps    : Nat := {s_crit}
+def certifiedRewriteNs  : Nat := {t_floor_ns}
+
+structure ValidRewriteSchedule where
+  makespanNs : Nat
+  compute_ok : rewriteWorkFlops <= peakFlopsPerNs * makespanNs
+  memory_ok  : rewriteTrafficBytes <= bwBytesPerNs * makespanNs
+  serial_ok  : rewriteCritSteps * tauNs <= makespanNs
+
+theorem rewrite_meets_compute_floor (s : ValidRewriteSchedule) :
+    {t_comp_floor} <= s.makespanNs := by
+  have h1 : peakFlopsPerNs * {t_comp_floor} <= rewriteWorkFlops := by decide
+  have h2 : peakFlopsPerNs * {t_comp_floor} <= peakFlopsPerNs * s.makespanNs :=
+    Nat.le_trans h1 s.compute_ok
+  exact Nat.le_of_mul_le_mul_left h2 (by decide : 0 < peakFlopsPerNs)
+
+theorem rewrite_meets_memory_floor (s : ValidRewriteSchedule) :
+    {t_mem_floor} <= s.makespanNs := by
+  have h1 : bwBytesPerNs * {t_mem_floor} <= rewriteTrafficBytes := by decide
+  have h2 : bwBytesPerNs * {t_mem_floor} <= bwBytesPerNs * s.makespanNs :=
+    Nat.le_trans h1 s.memory_ok
+  exact Nat.le_of_mul_le_mul_left h2 (by decide : 0 < bwBytesPerNs)
+
+theorem rewrite_meets_serial_floor (s : ValidRewriteSchedule) :
+    {t_ser_floor} <= s.makespanNs := by
+  have h1 : {t_ser_floor} = rewriteCritSteps * tauNs := by rfl
+  rw [h1]
+  exact s.serial_ok
+
+theorem certified_rewrite_speed_limit (s : ValidRewriteSchedule) :
+    certifiedRewriteNs <= s.makespanNs := by
+  have hc := rewrite_meets_compute_floor s
+  have hm := rewrite_meets_memory_floor s
+  have hs := rewrite_meets_serial_floor s
+  have hmax : certifiedRewriteNs <= {t_comp_floor} \\/ certifiedRewriteNs <= {t_mem_floor} \\/ certifiedRewriteNs <= {t_ser_floor} := by
+    decide
+  rcases hmax with h | h | h
+  · exact Nat.le_trans h hc
+  · exact Nat.le_trans h hm
+  · exact Nat.le_trans h hs
+
+theorem rewrite_witness_feasible : Exists (fun s : ValidRewriteSchedule => s.makespanNs = {t_star_ns}) := by
+  refine ⟨⟨{t_star_ns}, by decide, by decide, by decide⟩, rfl⟩
+
+#print axioms certified_rewrite_speed_limit
+#print axioms rewrite_witness_feasible
+
+end {ns}
+"""
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(lean_code)
+
+    out: dict[str, Any] = {
+        "lean_file": out_path,
+        "namespace": ns,
+        "certified_ns": t_floor_ns,
+        "witness_ns": t_star_ns,
+        "T_rewrite_floor_us": cert["T_rewrite_floor_us"],
+        "prescriptions": cert["prescriptions"],
         "verified": False,
         "exit_code": None,
         "stdout": "",

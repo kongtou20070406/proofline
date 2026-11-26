@@ -38,6 +38,8 @@ def main() -> None:
     p.add_argument("--formal-z3", action="store_true", help="run Z3 SMT lower-bound certificate check")
     p.add_argument("--emit-lean", default=None, help="emit and check Lean 4 speed-limit certificate file")
     p.add_argument("--symbolic", default=None, help="print SymPy symbolic bounds for op (gemm|sdpa|recurrent_wm)")
+    p.add_argument("--precision-sweep", action="store_true", help="sweep FP32/TF32/BF16/FP8/INT8/INT4 and 2:4 sparsity bounds")
+    p.add_argument("--rewrite-opt", action="store_true", help="run exact algebraic rewrite family (R_exact) Z3 optimization & prescriptions")
     a = p.parse_args()
 
     from .calibrate import load_profile
@@ -89,6 +91,33 @@ def main() -> None:
                 out_p = a.emit_lean if len(models) == 1 else f"{a.emit_lean}.{mname}.lean"
                 lres = formal_prover.emit_lean4_certificate(dag, gpu, out_p, phase=target_phase, verify=True)
                 print("[Lean4] %-14s certified=%dns exit=%s" % (mname, lres["certified_ns"], lres["exit_code"]))
+
+    if a.precision_sweep:
+        from .precision import precision_sweep, print_precision_sweep
+        for mname, mod in models.items():
+            res_sw = precision_sweep(mod, shape, gpu)
+            print_precision_sweep(res_sw, title=f"\n[Precision Sweep] {mname} on {gpu.name} (shape={shape})")
+
+    if a.rewrite_opt:
+        from . import autodiff_bounds
+        from . import formal_prover
+        target_phase = "fwd" if a.phase == "forward" else "train"
+        for mname, mod in models.items():
+            dag = autodiff_bounds.dag_from_torch_module(mod, shape, dtype=a.dtype, gpu=gpu)
+            rcert = formal_prover.prove_rewrite_family_z3(dag, gpu, phase=target_phase)
+            print(
+                "\n[RewriteOpt] %-14s T_base=%.2fus -> T_rewrite=%.2fus (%.2fx) proven=%s groups=%d"
+                % (
+                    mname,
+                    rcert["T_baseline_us"],
+                    rcert["T_rewrite_floor_us"],
+                    rcert["speedup_vs_baseline"],
+                    rcert["proven"],
+                    rcert["n_rewrite_groups"],
+                )
+            )
+            for pr in rcert["prescriptions"]:
+                print("  - [%s] %s -> %s (save %.2fus): %s" % (pr["rule"], pr["op"], pr["variant"], pr["delta_us"], pr["reason"]))
 
 
 if __name__ == "__main__":

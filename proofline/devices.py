@@ -30,21 +30,33 @@ def _dtype_key(dtype: Any) -> str:
     s = str(dtype).lower().replace("torch.", "").strip()
     if s in ("fp32", "float32", "float"):
         return "fp32"
+    if s in ("tf32", "tfloat32"):
+        return "tf32"
     if s in ("fp64", "float64", "double"):
         return "fp64"
     if s in ("fp16", "float16", "half"):
         return "fp16"
     if s in ("bf16", "bfloat16"):
         return "bf16"
+    if s in ("fp8", "float8", "float8_e4m3fn", "float8_e5m2", "fp8_e4m3", "fp8_e5m2"):
+        return "fp8"
+    if s in ("int8", "qint8", "uint8"):
+        return "int8"
+    if s in ("int4", "uint4", "fp4", "nf4"):
+        return "int4"
     return s
 
 
-def dtype_bytes(dtype: Any) -> int:
+def dtype_bytes(dtype: Any) -> float:
     k = _dtype_key(dtype)
     if k == "fp64":
         return 8
-    if k == "fp32":
+    if k in ("fp32", "tf32"):
         return 4
+    if k in ("fp8", "int8"):
+        return 1
+    if k == "int4":
+        return 0.5
     return 2
 
 
@@ -59,16 +71,38 @@ class GPU:
     tau_eager: float | None = None
     sram_bytes: float = 0.0
     sm_sram_bytes: float = 128.0 * 1024.0
+    F_tf32: float | None = None
+    F_fp8: float | None = None
+    F_int8: float | None = None
+    F_fp4: float | None = None
+    sparse_24_multiplier: float = 2.0
+    l2_bw_gbs: float | None = None
 
-    def peak_flops(self, dtype: Any = None) -> float:
-        """Return effective peak FLOP/s for the target precision."""
+    @property
+    def l2_bytes(self) -> float:
+        return float(self.sram_bytes)
+
+    def peak_flops(self, dtype: Any = None, sparse_24: bool = False) -> float:
+        """Return effective peak FLOP/s for the target precision and optional 2:4 sparsity."""
         k = _dtype_key(dtype)
         fp32_peak = self.F_fp32 if self.F_fp32 is not None else self.F / 2.0
         if k == "fp32":
-            return fp32_peak
-        if k == "fp64":
-            return fp32_peak / 2.0
-        return self.F
+            base = fp32_peak
+        elif k == "fp64":
+            base = fp32_peak / 2.0
+        elif k == "tf32":
+            base = self.F_tf32 if self.F_tf32 is not None else fp32_peak
+        elif k == "fp8":
+            base = self.F_fp8 if self.F_fp8 is not None else self.F * 2.0
+        elif k == "int8":
+            base = self.F_int8 if self.F_int8 is not None else (self.F_fp8 if self.F_fp8 is not None else self.F * 2.0)
+        elif k == "int4":
+            base = self.F_fp4 if self.F_fp4 is not None else (self.F_fp8 * 2.0 if self.F_fp8 is not None else self.F * 4.0)
+        else:
+            base = self.F
+        if sparse_24 and k not in ("fp32", "fp64"):
+            base *= max(1.0, float(self.sparse_24_multiplier))
+        return float(base)
 
     @property
     def eager_tau(self) -> float:
@@ -118,34 +152,50 @@ GPU_PRESETS = {
     "t4": GPU(
         "T4", 65.0e12, 320e9, 10.0e-6, F_fp32=8.1e12,
         tau_graph=1.50e-6, tau_eager=10.0e-6, sram_bytes=4e6, sm_sram_bytes=64 * 1024.0,
+        F_tf32=8.1e12, F_fp8=65.0e12, F_int8=130.0e12, F_fp4=260.0e12,
+        sparse_24_multiplier=1.0, l2_bw_gbs=1200.0,
     ),
     "rtx4090": GPU(
         "RTX4090", 165.2e12, 1008e9, 10.0e-6, F_fp32=82.6e12,
         tau_graph=1.00e-6, tau_eager=10.0e-6, sram_bytes=72e6, sm_sram_bytes=128 * 1024.0,
+        F_tf32=82.6e12, F_fp8=330.3e12, F_int8=330.3e12, F_fp4=330.3e12,
+        sparse_24_multiplier=2.0, l2_bw_gbs=4500.0,
     ),
     "rtx5090": GPU(
         "RTX5090", 209.5e12, 1792e9, 10.32e-6, F_fp32=104.8e12,
         tau_graph=0.93e-6, tau_eager=10.32e-6, sram_bytes=96e6, sm_sram_bytes=128 * 1024.0,
+        F_tf32=104.8e12, F_fp8=419.0e12, F_int8=419.0e12, F_fp4=838.0e12,
+        sparse_24_multiplier=2.0, l2_bw_gbs=6500.0,
     ),
     "rtx5090_measured": GPU(
         "RTX5090-measured", 195.7e12, 1508e9, 10.32e-6, F_fp32=95.0e12,
         tau_graph=0.93e-6, tau_eager=10.32e-6, sram_bytes=96e6, sm_sram_bytes=128 * 1024.0,
+        F_tf32=95.0e12, F_fp8=391.4e12, F_int8=391.4e12, F_fp4=782.8e12,
+        sparse_24_multiplier=2.0, l2_bw_gbs=6000.0,
     ),
     "a100": GPU(
         "A100-80G", 312.0e12, 2039e9, 10.0e-6, F_fp32=19.5e12,
         tau_graph=1.20e-6, tau_eager=10.0e-6, sram_bytes=40e6, sm_sram_bytes=164 * 1024.0,
+        F_tf32=156.0e12, F_fp8=312.0e12, F_int8=624.0e12, F_fp4=624.0e12,
+        sparse_24_multiplier=2.0, l2_bw_gbs=5000.0,
     ),
     "h100": GPU(
         "H100", 989.4e12, 3350e9, 10.0e-6, F_fp32=67.0e12,
         tau_graph=1.00e-6, tau_eager=10.0e-6, sram_bytes=50e6, sm_sram_bytes=228 * 1024.0,
+        F_tf32=494.7e12, F_fp8=1978.9e12, F_int8=1978.9e12, F_fp4=1978.9e12,
+        sparse_24_multiplier=2.0, l2_bw_gbs=12000.0,
     ),
     "tpu_v5p": GPU(
         "TPU-v5p", 459.0e12, 2765e9, 5.0e-6, F_fp32=115.0e12,
         tau_graph=0.80e-6, tau_eager=5.0e-6, sram_bytes=96e6, sm_sram_bytes=16 * 1024.0 * 1024.0,
+        F_tf32=229.5e12, F_fp8=918.0e12, F_int8=918.0e12, F_fp4=918.0e12,
+        sparse_24_multiplier=1.0, l2_bw_gbs=10000.0,
     ),
     "cpu_avx512": GPU(
         "CPU-EPYC-9654", 5.5e12, 460e9, 15.0e-6, F_fp32=2.75e12,
         tau_graph=2.0e-6, tau_eager=15.0e-6, sram_bytes=384e6, sm_sram_bytes=1024 * 1024.0,
+        F_tf32=2.75e12, F_fp8=5.5e12, F_int8=11.0e12, F_fp4=11.0e12,
+        sparse_24_multiplier=1.0, l2_bw_gbs=2000.0,
     ),
 }
 

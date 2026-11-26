@@ -47,6 +47,7 @@ class OpNode:
     parents: tuple[int, ...] = ()
     requires_grad_in: bool = True
     requires_grad_param: bool = True
+    attrs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -220,6 +221,13 @@ class _DAGTraceMeter(TorchDispatchMode):
         w_bwd_dw = w_fwd if req_grad_param else 0.0
         tau_fwd = 1.0
         tau_bwd = 1.0
+        node_attrs: dict[str, Any] = {}
+        act_in_roots = [root_id for root_id, _, _, is_p, _ in in_infos if not is_p]
+        if act_in_roots:
+            node_attrs["input_root_id"] = act_in_roots[0]
+        node_attrs["act_in_bytes"] = float(sum(nb for _, _, nb, is_p, _ in in_infos if not is_p))
+        node_attrs["param_bytes"] = float(sum(nb for _, _, nb, is_p, _ in in_infos if is_p))
+        node_attrs["out_bytes"] = float(out_bytes)
 
         if kind == "sdpa" and len(in_tensors) >= 2:
             qt, kt = in_tensors[0], in_tensors[1]
@@ -243,6 +251,8 @@ class _DAGTraceMeter(TorchDispatchMode):
                 k = int(x.shape[-1])
                 n = int(w.shape[0])
                 batch = 1
+                node_attrs["has_bias"] = len(in_tensors) >= 3
+                node_attrs["is_linear"] = True
             elif short in ("bmm", "baddbmm") and t0.dim() >= 3 and t1.dim() >= 3:
                 batch, m, k = int(t0.shape[0]), int(t0.shape[1]), int(t0.shape[2])
                 n = int(t1.shape[2])
@@ -252,6 +262,9 @@ class _DAGTraceMeter(TorchDispatchMode):
                 n = int(t1.shape[-1])
             else:
                 batch, m, k, n = 1, 1, 1, 1
+            node_attrs.update({"batch": batch, "m": m, "k": k, "n": n})
+            if has_param:
+                node_attrs["is_linear"] = True
             q_hk_fwd = _hong_kung_gemm_io(m, n, k, batch, self.b_elem, q_fwd, self.sm_sram_bytes)
             q_hk_bwd = (q_hk_fwd if req_grad_in else 0.0) + (q_hk_fwd if req_grad_param else 0.0)
             if not req_grad_param and short in ("bmm", "mm", "matmul", "baddbmm"):
@@ -261,6 +274,27 @@ class _DAGTraceMeter(TorchDispatchMode):
                 q_hk_bwd = 2.0 * q_hk_fwd if req_grad_in else q_fwd
         elif kind == "conv" and len(in_tensors) >= 2:
             q_hk_bwd = (q_fwd if req_grad_in else 0.0) + (q_fwd if req_grad_param else 0.0)
+            x, w = in_tensors[0], in_tensors[1]
+            ot = out_tensors[0] if out_tensors else None
+            if x.dim() == 4 and w.dim() == 4 and ot is not None and ot.dim() == 4:
+                stride = kwargs.get("stride", args[3] if len(args) > 3 else (1, 1))
+                if isinstance(stride, int):
+                    sh = sw = stride
+                elif isinstance(stride, (tuple, list)) and len(stride) >= 2:
+                    sh, sw = int(stride[0]), int(stride[1])
+                else:
+                    sh = sw = 1
+                node_attrs.update({
+                    "batch": int(x.shape[0]),
+                    "c_in": int(x.shape[1]),
+                    "c_out": int(w.shape[0]),
+                    "kh": int(w.shape[2]),
+                    "kw": int(w.shape[3]),
+                    "h_out": int(ot.shape[2]),
+                    "w_out": int(ot.shape[3]),
+                    "stride_h": sh,
+                    "stride_w": sw,
+                })
         elif kind == "reduce":
             # Softmax / Norm backward ~1.5-2x forward for activation grad
             w_bwd_dx = (1.5 if "softmax" in short else 1.5) * w_fwd if req_grad_in else 0.0
@@ -304,6 +338,7 @@ class _DAGTraceMeter(TorchDispatchMode):
                 parents=tuple(sorted(parent_ids)),
                 requires_grad_in=req_grad_in,
                 requires_grad_param=req_grad_param,
+                attrs=node_attrs,
             )
         )
 

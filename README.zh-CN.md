@@ -106,12 +106,25 @@ pip install "proofline[formal] @ git+https://github.com/kongtou20070406/prooflin
 
 可通过 `python -m proofline.cli --list-gpus` 查看全部预设，用 `proofline.GPU(...)` 自定义硬件参数，或在本机 GPU 上运行 `python -m proofline.measure_machine` 生成实测校准档。
 
-## 适用边界（什么时候实测能突破下限）
+## 适用边界与 v3 扩展（多精度、L2 驻留与等价改图）
 
-`T_abs_floor` 仅在**计算图与精度不变**时构成硬下限；打破下列任一前提时实测可以更快：
-1. **更改精度或稀疏格式**：例如量化为 FP8/INT4 或开启 2:4 硬件稀疏，实际改变了硬件算力峰值 $F_{\text{eff}}$ 与每字节流量 $b$（切换 `dtype` 或设备预设即可重算）。
-2. **改写了算法本身**：例如将标准卷积换为 Winograd/FFT，或把稠密注意力换为稀疏/线性近似，属于更换计算图。
-3. **整网工作集全驻留 L2 Cache**：若权重与激活总量低于芯片 L2 容量（例如 RTX 5090 的 96 MB），持久运行可免去 HBM 往返。
+`T_abs_floor` 仅在**计算图与精度不变**时构成硬下限。Proofline v3 对三种突破朴素基准下限的路径给出了显式建模：
+1. **多精度与 2:4 结构化稀疏（`--precision-sweep`）**：切到 `FP8`/`INT8`/`INT4` 或开启 2:4 硬件稀疏会更新 `F_eff` 与字节流量 `b`（含分组量化 scale 元数据开销），同时强制 `LayerNorm`、`RMSNorm`、`Softmax` 与残差累加保留高精度（`>= bf16/fp32`）。
+2. **L2 Cache 稳态驻留**：当权重与活跃激活总量小于芯片 L2 容量（例如 RTX 5090 的 96 MB）时，`phase_report` 会在冷启动 HBM 下界之外同步给出 `T_l2_resident_us`。
+3. **严格等价改写族与改图处方（`--rewrite-opt`）**：通过 Z3 `Optimize` + `UNSAT` 在严格代数等价改写族 $\mathcal{R}_{\text{exact}}$（矩阵链结合律、同输入 QKV/SwiGLU 融合、`Conv3x3` Direct/Winograd/FFT 切换、激活重计算权衡）内求得最低时延下界并输出改图处方；稀疏/线性注意力等近似算法会改变输出函数，归为近似对照，不混入严格等价证明。
+
+`transformer_block` 在 `RTX5090-measured`（`(1, 256, 512)`）下的 `--precision-sweep --rewrite-opt` 实测输出：
+
+```text
+[Precision Sweep] transformer_block on RTX5090-measured (shape=(1, 256, 512))
+Format         2:4      T_fwd(us)  T_abs(us)     Q(MB)  vs_FP32 Binding  HighPrecOps
+----------------------------------------------------------------------------------
+FP32           no           41.03      19.53    49.033    1.00x memory   6 (norm=fp32)
+BF16           no           25.98      19.53    24.517    1.58x serial   6 (norm=bf16)
+FP8(g128)+2:4  yes          20.54      19.53    14.604    2.00x serial   6 (norm=bf16)
+
+[RewriteOpt] transformer_block T_base=30.69us -> T_rewrite=30.69us (1.00x) proven=True groups=16
+```
 
 ## 形式化证明（Z3 + SymPy + Lean 4）
 

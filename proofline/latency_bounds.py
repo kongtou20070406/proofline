@@ -391,11 +391,27 @@ def phase_report(
 
     W_tot = sum(w for w, _ in stages)
     Q_tot = sum(q for _, q in stages)
+    in_out = 2.0 * ex_tensor.numel() * ex_tensor.element_size()
+    param_bytes_dt = sum(int(p.numel()) for p in model.parameters()) * float(ex_tensor.element_size())
     if q_min_io <= 0.0:
-        in_out = 2.0 * ex_tensor.numel() * ex_tensor.element_size()
         param_bytes = sum(int(p.numel()) * int(p.element_size()) for p in model.parameters())
         q_min_io = in_out + param_bytes
     t_abs = max(W_tot / f_eff, q_min_io / bw, tau_g if stages else 0.0)
+
+    # L2 Cache Resident Steady-State Bound
+    peak_act_bytes = max(in_out, max((q for _, q in stages), default=0.0))
+    working_set_bytes = param_bytes_dt + peak_act_bytes
+    g_obj = gpu if gpu is not None else (GPU_PRESETS["rtx5090_measured"] if (peak_flops is None and peak_bandwidth is None) else None)
+    l2_cap = float(getattr(g_obj, "l2_bytes", getattr(g_obj, "sram_bytes", 0.0))) if g_obj is not None else 0.0
+    l2_bw_gbs = getattr(g_obj, "l2_bw_gbs", None) if g_obj is not None else None
+    l2_bw = float(l2_bw_gbs) * 1e9 if l2_bw_gbs is not None else bw
+    l2_resident = (l2_cap > 0.0) and (working_set_bytes <= l2_cap)
+    if l2_resident and l2_bw > bw:
+        t_l2_fwd = sum(max(w / f_eff, q / l2_bw, tau_g) for w, q in stages) if stages else 0.0
+        t_l2_abs = max(W_tot / f_eff, q_min_io / l2_bw, tau_g if stages else 0.0)
+    else:
+        t_l2_fwd = fwd
+        t_l2_abs = t_abs
 
     t_comp_sum = W_tot / f_eff
     t_mem_sum = Q_tot / bw
@@ -419,6 +435,11 @@ def phase_report(
         "融合访存_MB": Q_tot / 1e6,
         "跟踪路径": trace_path,
         "dtype": str(dt).replace("torch.", ""),
+        "l2_resident": l2_resident,
+        "working_set_mb": working_set_bytes / 1e6,
+        "l2_capacity_mb": l2_cap / 1e6,
+        "T_l2_resident_us": t_l2_fwd * 1e6,
+        "T_l2_resident_abs_us": t_l2_abs * 1e6,
     }
 
 
@@ -428,6 +449,16 @@ def print_phase_report(report: dict[str, Any]) -> None:
     print("  训练一步      : %10.1f 微秒" % (report["理论最短_训练一步_秒"] * 1e6))
     if "绝对极限_前向_秒" in report:
         print("  跨层持久核极限: %10.1f 微秒" % (report["绝对极限_前向_秒"] * 1e6))
+    if report.get("l2_resident"):
+        print(
+            "  L2常驻稳态极限: %10.1f 微秒 (working_set=%.2f MB <= L2=%.1f MB, abs=%.1f us)"
+            % (
+                report["T_l2_resident_us"],
+                report["working_set_mb"],
+                report["l2_capacity_mb"],
+                report.get("T_l2_resident_abs_us", report["T_l2_resident_us"]),
+            )
+        )
     print(
         "  （反向约为前向 %.1f 倍 | 融合阶段 %d | 瓶颈 %s | %.2f GFLOP / %.1f MB | AI=%.1f FLOP/B）"
         % (

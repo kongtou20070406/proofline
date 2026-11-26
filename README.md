@@ -106,12 +106,25 @@ For local Lean 4 verification, install [Lean 4](https://leanprover.github.io/) (
 
 Run `python -m proofline.cli --list-gpus` for all presets, instantiate `proofline.GPU(...)` for custom ASICs/GPUs, or measure your local GPU directly with `python -m proofline.measure_machine`.
 
-## Caveats (When Real Code Can Beat the Floor)
+## Caveats & v3 Extensions (Precision, L2 Residency & Exact Rewrites)
 
-`T_abs_floor` is a hard lower bound **only under fixed math and precision**. Real code can run faster than a computed floor only if one of three assumptions changes:
-1. **Precision or structured sparsity changes**: Quantizing FP32/BF16 to FP8/INT4 or enabling 2:4 hardware sparsity raises `F_eff` and halves/quarters byte width `b` (switch `dtype` or device preset accordingly).
-2. **Algorithmic rewrite**: Replacing dense attention or convolution with FFT/Winograd/linear attention changes total `W` and the compute DAG itself.
-3. **Entire working set fits in L2 Cache**: If weights + intermediate activations fit inside L2 (e.g., 96 MB on RTX 5090), persistent traffic stays on-chip instead of hitting HBM bandwidth.
+`T_abs_floor` is a hard lower bound **only under fixed math and precision**. Proofline v3 models three ways real code can move below a naive baseline floor:
+1. **Precision & 2:4 structured sparsity (`--precision-sweep`)**: Quantizing to `FP8`/`INT8`/`INT4` or enabling 2:4 sparsity updates `F_eff` and byte width `b` (including group-quant scale metadata) while keeping sensitive ops (`LayerNorm`, `RMSNorm`, `Softmax`, residual adds) at high precision (`>= bf16/fp32`).
+2. **L2 Cache resident steady state**: When weights + active activations fit inside chip L2 (e.g., 96 MB on RTX 5090), `phase_report` also emits `T_l2_resident_us` alongside cold-start HBM bounds.
+3. **Exact equivalence rewrite family (`--rewrite-opt`)**: Uses Z3 `Optimize` + `UNSAT` over exact algebraic rewrites $\mathcal{R}_{\text{exact}}$ (MatMul chain associativity, shared-input GEMM fusion like QKV/SwiGLU, `Conv3x3` Direct vs. Winograd/FFT, and activation rematerialization) to prove the optimal rewrite-family floor and emit concrete prescriptions. Approximate algorithmic changes (e.g., sparse/linear attention) alter function outputs and stay outside $\mathcal{R}_{\text{exact}}$.
+
+Actual `--precision-sweep --rewrite-opt` output on `transformer_block` (`RTX5090-measured`, `(1, 256, 512)`):
+
+```text
+[Precision Sweep] transformer_block on RTX5090-measured (shape=(1, 256, 512))
+Format         2:4      T_fwd(us)  T_abs(us)     Q(MB)  vs_FP32 Binding  HighPrecOps
+----------------------------------------------------------------------------------
+FP32           no           41.03      19.53    49.033    1.00x memory   6 (norm=fp32)
+BF16           no           25.98      19.53    24.517    1.58x serial   6 (norm=bf16)
+FP8(g128)+2:4  yes          20.54      19.53    14.604    2.00x serial   6 (norm=bf16)
+
+[RewriteOpt] transformer_block T_base=30.69us -> T_rewrite=30.69us (1.00x) proven=True groups=16
+```
 
 ## Formal Proofs (Z3 + SymPy + Lean 4)
 
